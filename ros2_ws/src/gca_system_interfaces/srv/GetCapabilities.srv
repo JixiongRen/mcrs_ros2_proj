@@ -1,0 +1,10 @@
+---
+string backend
+bool simulation
+bool can_linear_motion
+bool can_rotation_motion
+bool can_stop
+bool can_measure_linear
+bool can_measure_rotation
+MotionLimits limits
+string[] unverified_capabilities

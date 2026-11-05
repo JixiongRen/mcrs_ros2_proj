@@ -1,0 +1,16 @@
+[tool.pytest.ini_options]
+testpaths = ["tests", "ros2_ws/src/gca_core/test", "ros2_ws/src/gca_ros/test", "ros2_ws/src/system_coordinator/test", "ros2_ws/src/system_bringup/test"]
+addopts = "-ra"
+markers = [
+  "integration: launches isolated ROS processes with simulated devices",
+  "hil: requires explicit real-device authorization and configuration",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["legacy", ".venv", "artifacts", "ros2_ws/build*", "ros2_ws/install*", "ros2_ws/log*"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+

@@ -1,0 +1,4 @@
+float64 max_linear_m_s
+float64 max_linear_m_s2
+float64 max_rotation_rad_s
+float64 max_rotation_rad_s2

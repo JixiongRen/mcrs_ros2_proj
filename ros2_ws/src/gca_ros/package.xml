@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>gca_ros</name><version>0.1.0</version>
+  <description>ROS host and CLI for supervised dual-axis motion</description>
+  <maintainer email="maintainers@example.invalid">GCA maintainers</maintainer>
+  <license>LicenseRef-Project-Unspecified</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend><exec_depend>gca_system_interfaces</exec_depend>
+  <exec_depend>gca_core</exec_depend><exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend><exec_depend>lifecycle_msgs</exec_depend><exec_depend>python3-yaml</exec_depend>
+  <test_depend>ament_pytest</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

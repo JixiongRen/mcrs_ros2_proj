@@ -1,0 +1,12 @@
+CommandContext context
+string owner
+string mode
+string token
+float64 lease_s
+---
+bool accepted
+string error_code
+string message
+CommandContext context
+string token
+float64 granted_lease_s

@@ -1,0 +1,10 @@
+string session_id
+string token
+string command_id
+---
+bool found
+string status
+string error_code
+string message
+uint8 outcome
+GcaState state

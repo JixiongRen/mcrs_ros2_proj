@@ -1,0 +1,7 @@
+# Ubuntu/ROS provides pytest, PyYAML, numpy, matplotlib and the ament/colcon toolchain.
+# These supplementary packages install only into the project's .venv.
+dynamixel-sdk==4.1.0
+pigpio==1.78
+pyserial==3.5
+ruff==0.17.3
+

@@ -1,0 +1,81 @@
+# NOT RUNNABLE: all physical values require device records / calibration / HIL.
+# This template must fail configure/ARM; never replace nulls with simulation values.
+# devices is merged into RuntimeConfig.hardware by gca_ros config_file loading.
+runtime:
+  backend: hardware
+  revision: hardware-unverified
+  control_period_s: null          # Measured scheduling budget, seconds.
+  encoder_period_s: null          # Verified device update/transaction period.
+  io_period_s: null
+  feedback_max_age_s: null
+  output_ttl_s: null
+  io_timeout_s: null
+  stop_timeout_s: null
+  lease_max_s: null
+  queue_capacity: 64              # Software resource policy, not physical calibration.
+  history_capacity: 256
+  linear_min_mm: null
+  linear_max_mm: null
+  rotation_min_deg: null
+  rotation_max_deg: null
+  max_linear_mm_s: null
+  max_linear_mm_s2: null
+  max_rotation_deg_s: null
+  max_rotation_deg_s2: null
+  encoder_mm_per_count: null
+  encoder_count_modulus: null     # 0 only after confirming no modulo unwrapping needed.
+  max_encoder_speed_mm_s: null
+  kp: null                       # New speed-output loop requires independent tuning.
+  ki: null
+  kd: null
+  kaw: null
+  integral_limit_mm_s: null
+  position_tolerance_mm: null
+  velocity_tolerance_mm_s: null
+  settle_s: null
+  pulses_per_motor_rev: null      # Legacy 6400/25600 conflict: inspect actual switches.
+  catheter_per_motor_ratio: null  # Catheter angle / motor angle, independently measured.
+  pulse_segment_s: null
+  hardware_verified: false
+
+devices:
+  servo:
+    port: null                   # Stable, identity-checked path; never blind USB fallback.
+    baudrate: null
+    device_id: null
+    model_number: null           # Only XM430-W350 model 1020; real identity still unverified.
+    mm_per_revolution: null
+    velocity_unit_rpm: null
+    max_velocity_raw: null
+    watchdog_raw: null            # Nonzero 1..127; requires firmware v38+.
+    direction_sign: null         # +1 or -1, applied exactly once.
+    transaction_timeout_s: null
+    verified: false
+  encoder:
+    port: null                   # /dev/ttySC1 in legacy does not prove electrical type.
+    baudrate: null
+    address: null
+    register: null
+    bits: null
+    signed: null
+    quiet_s: null                # Above verified maximum delayed response.
+    byteorder: null
+    modulus: null                # Optional; never assume old 1800-turn rule.
+    transaction_timeout_s: null
+    verified: false
+  pulse:
+    pulse_gpio: null             # BCM, legacy BOARD29 is only a wiring clue.
+    direction_gpio: null         # BCM, legacy BOARD31 is only a wiring clue.
+    high_us: null
+    low_us: null
+    direction_setup_us: null
+    direction_hold_us: null
+    max_segment_s: null
+    max_segment_pulses: null
+    positive_direction_level: null
+    host: localhost
+    port: 8888
+    socket_timeout_s: null
+    verified: false
+    exclusive_wave_owner: false  # OS lock plus restricted daemon access must be established.
+    waveform_hil_verified: false # Set only after a real H02 qualification record.

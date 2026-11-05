@@ -1,0 +1,8 @@
+CommandContext context
+string token
+string name
+bool enabled
+---
+bool accepted
+string error_code
+string message

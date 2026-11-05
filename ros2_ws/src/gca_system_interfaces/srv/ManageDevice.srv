@@ -1,0 +1,11 @@
+CommandContext context
+string token
+uint8 axis_mask
+float64 linear_m
+float64 rotation_rad
+---
+bool accepted
+string error_code
+string message
+string operation_id
+GcaState state

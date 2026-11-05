@@ -1,0 +1,9 @@
+uint8 ABSOLUTE=1
+uint8 RELATIVE=2
+uint8 LINEAR=1
+uint8 ROTATION=2
+uint8 mode
+uint8 axis_mask
+float64 linear_m
+float64 rotation_rad
+string reference_id

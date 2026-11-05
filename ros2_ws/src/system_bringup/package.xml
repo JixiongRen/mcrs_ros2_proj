@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>system_bringup</name>
+  <version>0.1.0</version>
+  <description>GCA-only launch and explicit simulation/hardware profiles.</description>
+  <maintainer email="maintainer@example.invalid">GCA project contributors</maintainer>
+  <license>LicenseRef-Project-Unspecified</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>gca_ros</exec_depend>
+  <exec_depend>system_coordinator</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

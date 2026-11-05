@@ -1,0 +1,41 @@
+# Python environments and caches (including the old sensor environment).
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+!.env.template
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+
+# Generated ROS workspace outputs and reproducible verification evidence.
+/ros2_ws/build*/
+/ros2_ws/install*/
+/ros2_ws/log*/
+/artifacts/
+
+# These legacy sources are committed as ordinary file snapshots. Ignore new
+# untracked files here so local embedded repositories never become gitlinks.
+# Existing tracked files remain versioned; their original .git stays local.
+/legacy/SteeringGearControl/DynamixelSDK/
+/legacy/SteeringGearControl/Dynamixel_Control/
+/legacy/SteeringGearControl/Dynamixel-XM430-W350/
+/legacy/SteeringGearControl/Dynamixel-XM430-W350_1/
+/legacy/SteeringGearControl/async_driver/
+
+# Local editor files and alternate CLI session files.
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+.DS_Store
+.gca-session*.json

@@ -1,0 +1,10 @@
+CommandContext context
+string token
+# Parsed once at the ROS boundary through the complete typed configuration schema.
+string configuration_yaml
+---
+bool accepted
+string error_code
+string message
+string requested_revision
+string applied_revision

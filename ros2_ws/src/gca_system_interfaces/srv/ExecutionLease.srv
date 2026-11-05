@@ -1,0 +1,12 @@
+# This is a coordinator-only deployment capability, never a public user session token.
+string coordinator_key
+CommandContext context
+string token
+float64 lease_s
+bool release
+---
+bool accepted
+string error_code
+string message
+string token
+float64 granted_lease_s
