@@ -17,6 +17,10 @@ def config():
         pulse_segment_s=0.03,
         max_linear_mm_s=1,
         encoder_count_modulus=0,
+        pulse_high_us=2,
+        pulse_low_us=2,
+        direction_setup_us=5,
+        direction_hold_us=5,
         hardware={
             "servo": asdict(
                 DynamixelConfig("/no-servo", 57600, 1, 1020, 40, 0.229, 500, 3, verified=True)

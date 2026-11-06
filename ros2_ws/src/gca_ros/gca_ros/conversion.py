@@ -2,8 +2,10 @@
 
 import math
 
+from gca.domain.manual import ManualInputQuality
 from gca.domain.models import CommandContext, JogCommand, MotionCommand, MotionLimits
 from gca_system_interfaces.msg import GcaState, StopStatus
+from gca_system_interfaces.msg import ManualInputQuality as QualityMessage
 
 
 def context_from_ros(msg):
@@ -33,6 +35,18 @@ def motion_from_ros(goal):
     )
 
 
+def quality_from_ros(msg):
+    return ManualInputQuality(
+        **{name: getattr(msg, name) for name in ManualInputQuality.__dataclass_fields__}
+    )
+
+
+def quality_to_ros(quality):
+    return QualityMessage(
+        **{name: getattr(quality, name) for name in ManualInputQuality.__dataclass_fields__}
+    )
+
+
 def jog_from_ros(msg):
     return JogCommand(
         context_from_ros(msg.context),
@@ -42,6 +56,7 @@ def jog_from_ros(msg):
         msg.token,
         msg.ttl_s,
         msg.deadman,
+        quality=quality_from_ros(msg.quality) if msg.deadman else None,
     )
 
 
@@ -100,4 +115,14 @@ def state_from_core(state, stamp=None, requested_revision=""):
     msg.requested_velocity_m_s = state.requested_velocity_mm_s / 1000.0
     msg.applied_velocity_m_s = state.applied_velocity_mm_s / 1000.0
     msg.output_seq = state.output_seq
+    msg.stop_serial = getattr(state, "stop_serial", 0)
+    msg.input_valid_until_ns = getattr(state, "input_valid_until_ns", 0)
+    msg.jog_linear_velocity_m_s = getattr(state, "jog_linear_velocity_mm_s", 0.0) / 1000.0
+    msg.jog_rotation_velocity_rad_s = math.radians(
+        getattr(state, "jog_rotation_velocity_deg_s", 0.0)
+    )
+    msg.estimated_rotation_velocity_rad_s = math.radians(getattr(state, "rotation_rate_deg_s", 0.0))
+    msg.rotation_planned_phase_rad = math.radians(getattr(state, "rotation_planned_phase_deg", 0.0))
+    msg.jog_velocity_error_m_s = getattr(state, "jog_velocity_error_mm_s", 0.0) / 1000.0
+    msg.jog_velocity_integral_m_s = getattr(state, "jog_velocity_integral_mm_s", 0.0) / 1000.0
     return msg

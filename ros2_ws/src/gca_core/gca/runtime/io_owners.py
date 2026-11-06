@@ -39,15 +39,21 @@ class DeviceIOOwners:
                 self._count_evidence_lost.set()
         self._wake.set()
 
-    def _valid_output(self, expires_ns: int, generation: int, feedback_ns: int = 0) -> bool:
+    def _valid_output(
+        self, expires_ns: int, generation: int, feedback_ns: int = 0, stop_serial: int | None = None
+    ) -> bool:
         now = self.clock()
         return (
             self._permit
+            and self._stop_request is None
+            and self._armed_stop_serial == self.stop_serial
             and self._active_lifecycle
             and self._lease is not None
             and now < self._lease_deadline
             and now < expires_ns
+            and (not self._input_deadline or now < self._input_deadline)
             and generation == self._output_generation
+            and (stop_serial is None or stop_serial == self.stop_serial)
             and (not feedback_ns or now - feedback_ns <= int(self.config.feedback_max_age_s * 1e9))
         )
 
@@ -69,17 +75,26 @@ class DeviceIOOwners:
                     and self._state.armed
                 )
                 if self._servo_enabled != enabled:
-                    self.servo.enable(enabled)
-                    self._servo_enabled = enabled
+                    if enabled:
+                        # The stop fence linearizes before any not-yet-started
+                        # enable transaction. Underlying SDK I/O remains bounded.
+                        with self._stop_lock:
+                            if self._armed_stop_serial == self.stop_serial:
+                                self.servo.enable(True)
+                                self._servo_enabled = True
+                    else:
+                        self.servo.enable(False)
+                        self._servo_enabled = False
                 demand = self._velocity_demand.get()
-                valid = demand and self._valid_output(
-                    demand.expires_ns, demand.generation, demand.feedback_ns
-                )
-                if valid and demand.seq != last_seq:
-                    accepted = self.servo.write_velocity(demand.velocity, deadline)
-                    self._io_event("applied", (demand.seq, demand.generation, accepted))
-                    last_seq, last_motion = demand.seq, abs(demand.velocity) > 0
-                elif not valid:
+                with self._stop_lock:
+                    valid = demand and self._valid_output(
+                        demand.expires_ns, demand.generation, demand.feedback_ns, demand.stop_serial
+                    )
+                    if valid and demand.seq != last_seq:
+                        accepted = self.servo.write_velocity(demand.velocity, deadline)
+                        self._io_event("applied", (demand.seq, demand.generation, accepted))
+                        last_seq, last_motion = demand.seq, abs(demand.velocity) > 0
+                if not valid:
                     stopping_generation = self._output_generation
                     self.servo.stop(deadline)
                     if last_motion or zero_reported_generation != stopping_generation:
@@ -96,7 +111,10 @@ class DeviceIOOwners:
                     ):
                         self._permit = False
                         self._pulse_stop.set()
-                        self._io_event("fault", "OUTPUT_EXPIRED")
+                        if self._jog is not None and self.clock() >= self._jog_deadline:
+                            self._io_event("jog_expired", "JOG_EXPIRED")
+                        else:
+                            self._io_event("fault", "OUTPUT_EXPIRED")
                     last_motion = False
                 self._servo_sample.put(self.servo.read_state(deadline))
                 self._shutdown.wait(self.config.io_period_s)
@@ -170,16 +188,17 @@ class DeviceIOOwners:
                 if item:
                     segment, expires_ns = item
                     if segment.segment_id != last_id and self.pulse.is_idle():
-                        if self._valid_output(
-                            expires_ns, segment.generation
-                        ) and self.clock() + int(segment.duration_s * 1e9) <= min(
-                            expires_ns, self._lease_deadline
-                        ):
-                            self.pulse.submit(segment)
-                            active_id = segment.segment_id
-                            self._io_event("pulse_accepted", segment)
-                        else:
-                            self._io_event("pulse_rejected", segment)
+                        with self._stop_lock:
+                            if self._valid_output(
+                                expires_ns, segment.generation, stop_serial=segment.stop_serial
+                            ) and self.clock() + int(segment.duration_s * 1e9) <= min(
+                                expires_ns, self._lease_deadline
+                            ):
+                                active_id = segment.segment_id
+                                self.pulse.submit(segment)
+                                self._io_event("pulse_accepted", segment)
+                            else:
+                                self._io_event("pulse_rejected", segment)
                         last_id = segment.segment_id
                 self._pulse_idle = self.pulse.is_idle()
                 self._shutdown.wait(self.config.io_period_s)

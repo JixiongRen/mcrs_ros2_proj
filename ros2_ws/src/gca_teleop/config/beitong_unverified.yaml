@@ -1,0 +1,36 @@
+# Read-only metadata was observed. Physical axes/buttons and RF loss behavior
+# remain NOT_RUN. Null controls deliberately prevent motion/qualification.
+source: joydev
+profile_id: beitong-20bc-506d-unverified
+mode: event_age
+device:
+  vendor: 8380
+  product: 20589
+  name: BEITONG  BEITONG AXIULUO3SNS BFM DONGLE
+  path: null
+  axis_codes: [0, 1, 2, 5, 9, 10, 16, 17]
+  button_codes: [304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317, 318, 398]
+  device_mode: ''  # User must explicitly identify the receiver/controller mode.
+mapping:
+  lx: null
+  ly: null
+  lt: null
+  b_button: null
+  reserved_axes: []
+  reserved_buttons: []
+mapping_evidence: ''
+qualification_file: ''
+dispatch_hz: 25.0
+reader_timeout_s: 0.10
+input_max_age_s: 0.15
+poll_timeout_s: 0.02
+max_poll_events: 64
+max_poll_bytes: 512
+timestamp_uncertainty_s: 0.020
+max_epoch_s: 3600.0
+deadzone: 0.08
+response_exponent: 1.5
+lt_press: 0.6
+lt_release: 0.4
+max_linear_mm_s: 2.0
+max_rotation_deg_s: 30.0

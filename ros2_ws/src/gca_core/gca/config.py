@@ -34,6 +34,18 @@ class RuntimeConfig:
     kd: float = 0.0
     kaw: float = 2.0
     integral_limit_mm_s: float = 5.0
+    jog_velocity_kp: float = 0.25
+    jog_velocity_ki: float = 4.0
+    jog_velocity_kaw: float = 2.0
+    jog_integral_limit_mm_s: float = 10.0
+    jog_velocity_filter_s: float = 0.04
+    jog_dt_max_s: float = 0.2
+    manual_input_max_age_s: float = 0.15
+    jog_phase_gain_s: float = 8.0
+    pulse_high_us: int = 5
+    pulse_low_us: int = 5
+    direction_setup_us: int = 10
+    direction_hold_us: int = 10
     position_tolerance_mm: float = 0.08
     velocity_tolerance_mm_s: float = 0.15
     settle_s: float = 0.15
@@ -99,6 +111,12 @@ class RuntimeConfig:
             "pulses_per_motor_rev",
             "catheter_per_motor_ratio",
             "pulse_segment_s",
+            "jog_dt_max_s",
+            "manual_input_max_age_s",
+            "pulse_high_us",
+            "pulse_low_us",
+            "direction_setup_us",
+            "direction_hold_us",
         )
         if any(getattr(self, n) <= 0 for n in positive):
             raise ValueError("periods, limits, scales and capacities must be positive")
@@ -124,6 +142,34 @@ class RuntimeConfig:
             raise ValueError("gains/count modulus cannot be negative")
         if self.encoder_count_modulus == 1:
             raise ValueError("encoder_count_modulus must be 0 (disabled) or at least 2")
+        if any(
+            getattr(self, name) < 0
+            for name in (
+                "jog_velocity_kp",
+                "jog_velocity_ki",
+                "jog_velocity_kaw",
+                "jog_integral_limit_mm_s",
+                "jog_velocity_filter_s",
+                "jog_phase_gain_s",
+            )
+        ):
+            raise ValueError("Jog gains/filter cannot be negative")
+        if (
+            self.direction_setup_us
+            + max(self.direction_hold_us, self.pulse_low_us)
+            + self.pulse_high_us
+            >= self.pulse_segment_s * 1e6
+        ):
+            raise ValueError("pulse guards must fit the finite segment")
+        edge_rate = (
+            self.max_rotation_deg_s
+            * self.pulses_per_motor_rev
+            / (360 * self.catheter_per_motor_ratio)
+        )
+        if edge_rate > 1e6 / (self.pulse_high_us + self.pulse_low_us):
+            raise ValueError("maximum rotation rate violates pulse high/low timing")
+        if edge_rate * self.pulse_segment_s > 100_000:
+            raise ValueError("finite Jog edge profile exceeds bounded capacity")
         if self.backend == "hardware" and (not self.hardware_verified or not self.hardware):
             raise ValueError("hardware requires verified explicit device configuration")
 

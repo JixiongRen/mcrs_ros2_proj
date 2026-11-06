@@ -33,11 +33,14 @@ class SourceSession:
     renewal_sequence: int
     executor_token: str = ""
     needs_reauthorization: bool = False
+    stop_alias_generation: int = 0
+    handover_deadline: float = 0.0
 
 
 class SourceAuthority:
-    def __init__(self, maximum_s=5.0, clock=time.monotonic):
+    def __init__(self, maximum_s=5.0, clock=time.monotonic, handover_s=2.0):
         self.maximum_s = bounded_positive_seconds(maximum_s, "source_lease_max_s", minimum=0.1)
+        self.handover_s = bounded_positive_seconds(handover_s, "handover_timeout_s")
         self.clock = clock
         self.current = None
         self._generation = 0
@@ -101,7 +104,33 @@ class SourceAuthority:
     def rotate_generation(self, source):
         if self.current is not source:
             raise SessionError("SESSION_EXPIRED")
+        source.stop_alias_generation = source.generation
+        source.handover_deadline = self.clock() + self.handover_s
         self._generation += 1
         source.generation = self._generation
         source.renewal_sequence += 1
         source.executor_token = ""
+
+    def verify_stop(self, session_id, generation, token):
+        current = self.current
+        if (
+            current is not None
+            and current.session_id == session_id
+            and token
+            and secrets.compare_digest(current.token, token)
+            and generation == current.stop_alias_generation
+            and current.handover_deadline > self.clock()
+        ):
+            return current
+        try:
+            return self.verify(session_id, generation, token, allow_expired=True)
+        except SessionError:
+            return self.verify_retired(session_id, generation, token)
+
+    def acknowledge(self, session_id, generation, token):
+        source = self.verify(session_id, generation, token)
+        if source.handover_deadline and self.clock() >= source.handover_deadline:
+            raise SessionError("HANDOVER_EXPIRED")
+        source.stop_alias_generation = 0
+        source.handover_deadline = 0.0
+        return source

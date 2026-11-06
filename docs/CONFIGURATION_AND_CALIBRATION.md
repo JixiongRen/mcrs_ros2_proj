@@ -104,6 +104,47 @@ ros2 launch system_bringup simulation.launch.py config_file:=/绝对路径/你�
 
 每个新有效样本至多更新一次PID；首次/长间隔速度无效，不能填0满足到位。轨迹完成、最终误差、有效测量速度和驻留共同决定成功。异步输出回执按序号/代次只结算一次量化残差。
 
+### Jog速度PI、输入质量与有限边沿
+
+这些量与定位PID独立；当前模型值仅支撑无硬件回归，硬件文件必须显式填写并有整定/时序依据。它们不在允许运行中更新的字段集合内，变更需停止确认、DISARM和生命周期重新配置。
+
+| 字段 | 单位 | 模型默认 | 含义 |
+|---|---|---:|---|
+| jog_velocity_kp | 无量纲 | 0.25 | 外部测量速度误差的比例贡献 |
+| jog_velocity_ki | 1/s | 4.0 | 速度积分增益，不复用定位ki |
+| jog_velocity_kaw | 1/s | 2.0 | 最终限幅与接受量化残差一次回算 |
+| jog_integral_limit_mm_s | mm/s | 10.0 | Jog积分速度贡献上限 |
+| jog_velocity_filter_s | s | 0.04 | 新速度样本低通时间常数；0关闭 |
+| jog_dt_max_s | s | 0.2 | 真实控制/反馈dt允许预算，超预算停车，不密集追赶 |
+| manual_input_max_age_s | s | 0.15 | 接收端输入年龄政策上限，不能替源改写截止 |
+| jog_phase_gain_s | 1/s | 8.0 | 有限波形空档的有界相位误差修正 |
+| pulse_high_us / pulse_low_us | µs整数 | 5 / 5 | profile每脉冲最小高/低时间 |
+| direction_setup_us / direction_hold_us | µs整数 | 10 / 10 | profile方向前/后保护时间 |
+
+推进Jog为 `v_target + Kp*(v_target-v_measured_filtered) + I`；新有效反馈seq和真实dt只积分一次，输出经过速度/加速度/边界再提交抗饱和，接受回执只补额外残差。回中清历史修正，不能把摇杆积分成需追赶的虚拟位置。模型噪声/滑移可帮助回归，实机增益仍需H03。
+
+runtime四个脉冲时序字段须与 `devices.pulse.high_us/low_us/direction_setup_us/direction_hold_us` 一致，工厂不接受两套不同限制。保护时间须能放进有限段，配置的最大脉冲率须满足高低时间和有界profile容量。`edge_offsets_us` 为可选不可变整型µs上升沿表，None兼容原定位调用；给出profile时不回退均匀脉冲。完整段包括保护时间并满足所有原截止。
+
+手柄旋转映射最大值是长期平均意图；段内相位修正可高于意图，但仍受runtime核心角速度/加速度限制。若硬件速度上限没有足够余量抵消单wave提交空档，需降低可达平均意图并报告不足，不能把核心限制放宽为未经验证的数值。段内计划率、段间空档和跨段均速分开评估；H02决定实物适用性。
+
+### 手柄profile与证据文件
+
+安装资源在 `gca_teleop/config/`：`beitong_unverified.yaml` 保留未知映射null/模式空值，`synthetic.yaml`及其JSON只用于simulation。profile主字段为 source、profile_id、mode、device、mapping、mapping_evidence、qualification_file、script_file；未知键/类型、非有限数和越界值拒绝。device包含USB身份、名称、轴/键能力和操作者明确的device_mode，不凭名称自动映射。
+
+| 输入参数 | 合成/未核实模板值 | 解释 |
+|---|---:|---|
+| deadzone / response_exponent | 0.08 / 1.5 | 左轴各自独立死区与幅度曲线，不使用径向死区制造串扰 |
+| lt_press / lt_release | 0.6 / 0.4 | 归一化扳机滞回；LT不乘速度幅度 |
+| max_linear_mm_s / max_rotation_deg_s | 2 / 30 | 输入意图范围，不是实机已测安全速度 |
+| dispatch_hz | 25 | 容量1最新输入派发；慢许可不无限排队 |
+| input_max_age_s / reader_timeout_s | 0.15 / 0.10 | GCA事件有效期与reader存活分开 |
+| poll_timeout_s / max_poll_events / max_poll_bytes | 0.02 / 64 / 512 | 有界只读采集与8字节joydev解析预算 |
+| timestamp_uncertainty_s / max_epoch_s | 0.020 / 3600 | joydev时间映射不确定度与epoch上限，不把接收时间冒充事件时间 |
+
+映射必须有LX/LY两端/中心、LT两端、B按松以及所有预留键的真实事件记录与摘要。当前证据schema_version=2：读取时依据有界原始全轨迹重新计算端点/中心、所选样本与selection_policy，再核对mapping；摘要用于完整性检查，单凭摘要不代表映射来自原记录。只读元数据和部分采集不够。qualified_state还需匹配设备/驱动/内核/模式/映射的资格记录，合成记录不能用于实体。两种模式及可复现向导见 [手柄指南](TELEOP_USER_GUIDE.md)。修改/切换profile仅在停止CONFIRMED且DISARMED时通过同owner `input-config`，新epoch和释放/回中门控重建，不自动恢复意图。
+
+软件可控性门槛独立版本化在 `system_bringup/config/teleop_acceptance.yaml`（teleop-controllability-v3）。v3保留v1/v2全部23场景及原门槛；v2在原17场景上另预声明执行器死区0.01/0.5mm/s及目标±0.25mm/s；仍按2s后W=0.5s、5%或2计数/W及回中2计数评价。另以1mm/s实际接受上限限制±2意图，1s解除，解除后2s的W=0.5s误差仍≤0.1mm/s，积分贡献回落≤0.1mm/s。动态限制只改变独立plant能力，不改目标/传感器读数；新6场景并入完整23场景报告。v3另固定long_model共同周期30s、首稳态端点30s、每周期2counts/1pulse漂移及累计N倍预算、无失步计数/真值1pulse误差、0.5s最终稳定和两次完整同seed运行。末尾1s零速观察仍用原2counts；数值ULP比较guard与物理预算分开报告，不强制速度Jog位置锁定。它描述合成测试，不是硬件标定文件；更改门槛需预先声明版本、重新验证，不能为某次失败事后放宽。
+
 ### 仿真专用参数
 
 | 字段 | 单位/类型 | 默认 | 解释 |
@@ -173,7 +214,7 @@ plant的默认一阶时间常数、死区、饱和和每脉冲角度还定义在
 | exclusive_wave_owner | bool | 本机锁与daemon访问受控，不能靠任意客户端自称独占 | false |
 | waveform_hil_verified | bool | 有完整段波形/计数证据和H02记录 | false |
 
-硬件宿主还要求强制DDS安全（ROS_SECURITY_ENABLE=true且ROS_SECURITY_STRATEGY=Enforce），或ROS_LOCALHOST_ONLY=1配合显式trusted_local_control=true的受控本机部署；仅设置发现范围不是认证。三个波形布尔条件均满足才允许真实波形open。单段时长包括方向前后时序，必须容纳全部高低电平时间。后端不是按elapsed time猜计数；中止未知作废参考。当前没有软件EN输出，也没有自动读取细分拨码。见 [接线说明](HARDWARE_WIRING.md)。
+硬件宿主还要求强制DDS安全（ROS_SECURITY_ENABLE=true且ROS_SECURITY_STRATEGY=Enforce），或ROS_LOCALHOST_ONLY=1配合显式trusted_local_control=true的受控本机部署；仅设置发现范围不是认证。三个波形布尔条件均满足才允许真实波形open。单段时长包括方向前后时序，必须容纳全部高低电平时间。真实pigpio在波形准备完成、wave_send触发前，再要求整型µs实际段时长加ceil(socket_timeout_s)的声明发送RPC预算能落入原截止；不足即拒绝，不缩段、不续期。正式runtime始终提供固定expires_ns；底层expires_ns=0只保留旧直接端口调用兼容，不代表正式运动无期限。该预算不是实测RPC/OS/电气启动上界，H02/H03仍需测量。后端不是按elapsed time猜计数；中止未知作废参考。当前没有软件EN输出，也没有自动读取细分拨码。见 [接线说明](HARDWARE_WIRING.md)。
 
 ## ROS宿主附加参数
 
@@ -198,6 +239,7 @@ plant的默认一阶时间常数、死区、饱和和每脉冲角度还定义在
 | coordinator_key | 默认空值拒绝启动；由launch与设备节点共享随机值 | 领取设备执行许可所需的能力，不能写入记录或当作DDS身份认证 |
 | source_lease_max_s | 5.0 s；有限且≥0.1 s | 源控制会话的最大租约；每次申请仍须在0.1 s至该上限之间 |
 | executor_lease_s | 2.0 s；有限且0.1–5.0 s | 下游执行许可的单次期限，同时不得超过源会话剩余期限 |
+| handover_timeout_s | 2.0 s | ARM代次交接确认期限；超时停车/撤权，不默认成功 |
 | rpc_timeout_s | 2.0 s；有限且>0 | 等待下游服务的墙钟期限，超时失败；不改变本地输出TTL |
 
 变更后重启协调器并重新领取会话。普通launch不传入这三个时间参数，使用上述已测试的软件默认值；实机期限仍须结合H03测量确定。

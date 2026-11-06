@@ -4,6 +4,8 @@ import threading
 import time
 
 import rclpy
+from gca.domain.manual import ManualInputQuality, host_clock_id
+from gca_ros.conversion import quality_to_ros
 from gca_system_interfaces.msg import CommandContext, JogCommand
 from rclpy.executors import MultiThreadedExecutor
 from system_coordinator.node import SystemCoordinator
@@ -60,8 +62,29 @@ def test_jog_worker_exit_and_new_ingress_schedule_exactly_one_successor():
         assert reached_finally.wait(1.0)
         # Ownership is retained until the atomic finally/handoff operation.
         assert node._jog_forwarding
+        now_ns = time.monotonic_ns()
+        quality = ManualInputQuality(
+            "SCRIPT_SAMPLE",
+            "test",
+            "epoch",
+            1,
+            now_ns,
+            "MONOTONIC",
+            1,
+            now_ns,
+            now_ns + 150_000_000,
+            host_clock_id(),
+            "SYNTHETIC",
+        )
         node._jog(
-            JogCommand(context=context, token=envelope, deadman=True, axis_mask=3, ttl_s=0.15)
+            JogCommand(
+                context=context,
+                token=envelope,
+                deadman=True,
+                axis_mask=3,
+                ttl_s=0.15,
+                quality=quality_to_ros(quality),
+            )
         )
         assert node._pending_jog is not None
         assert created == []

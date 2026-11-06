@@ -232,7 +232,7 @@ def test_finite_permit_valid_at_final_trigger_is_accepted(engine):
     now = [1_000_000_000]
     adapter.clock = lambda: now[0]
     adapter.open()
-    request = replace(segment(adapter), expires_ns=now[0] + 60_000_000)
+    request = replace(segment(adapter), expires_ns=now[0] + 120_000_000)
     adapter.submit(request)
     assert client.busy == 1
 
@@ -246,3 +246,80 @@ def test_invalid_permit_deadline_never_prepares_wave(engine, expiry):
         adapter.submit(request)
     assert caught.value.code == "INVALID_ARGUMENT"
     assert client.waveform == [] and not client.busy
+
+
+def test_nonuniform_edge_profile_is_emitted_exactly_and_never_uniformized(engine):
+    adapter, client = engine
+    adapter.open()
+    edges = (20, 1000, 2500, 6000)
+    request = replace(segment(adapter, count=4), edge_offsets_us=edges)
+    adapter.submit(request)
+    elapsed, actual = 0, []
+    for pulse in client.waveform:
+        if pulse.gpio_on & (1 << 5):
+            actual.append(elapsed)
+        elapsed += pulse.delay
+    assert actual == list(edges)
+    assert elapsed == 20000
+    client.busy = 0
+    assert adapter.poll()[0].signed_pulses == 4
+
+
+@pytest.mark.parametrize("edges", [[10, 100], (1, 100), (10, 12), (10, 19999), (10,), (10, 10.5)])
+def test_invalid_nonuniform_profiles_never_prepare_or_send(engine, edges):
+    adapter, client = engine
+    adapter.open()
+    with pytest.raises(DeviceError):
+        adapter.submit(replace(segment(adapter, count=2), edge_offsets_us=edges))
+    assert client.waveform == [] and not client.busy
+
+
+def test_duration_only_deadline_without_send_budget_never_triggers(engine):
+    adapter, client = engine
+    now = [1_000_000_000]
+    adapter.clock = lambda: now[0]
+    adapter.open()
+    request = replace(segment(adapter), expires_ns=now[0] + 20_000_000)
+    sends = []
+    client.wave_send_once = lambda wave: sends.append(wave)
+    with pytest.raises(DeviceError) as caught:
+        adapter.submit(request)
+    assert caught.value.code == "PULSE_EXPIRED"
+    assert sends == [] and not client.busy
+    assert client.deleted == [client.wave_id]
+
+
+def test_declared_send_budget_can_be_consumed_and_whole_wave_still_fits(engine):
+    adapter, client = engine
+    now = [1_000_000_000]
+    adapter.clock = lambda: now[0]
+    adapter.open()
+    budget_ns = round(adapter.config.socket_timeout_s * 1e9)
+    request = replace(segment(adapter), expires_ns=now[0] + budget_ns + 20_000_000)
+    original = client.wave_send_once
+
+    def delayed_send(wave_id):
+        now[0] += budget_ns
+        return original(wave_id)
+
+    client.wave_send_once = delayed_send
+    adapter.submit(request)
+    assert client.busy
+    assert now[0] + sum(p.delay for p in client.waveform) * 1000 <= request.expires_ns
+
+
+def test_trigger_guard_uses_real_microsecond_wave_duration(engine):
+    adapter, client = engine
+    now = [1_000_000_000]
+    adapter.clock = lambda: now[0]
+    adapter.open()
+    duration = 0.0200006  # Quantizes upward to 20,001 actual GPIO microseconds.
+    request = replace(
+        segment(adapter),
+        duration_s=duration,
+        expires_ns=now[0] + round(adapter.config.socket_timeout_s * 1e9) + round(duration * 1e9),
+    )
+    with pytest.raises(DeviceError) as caught:
+        adapter.submit(request)
+    assert caught.value.code == "PULSE_EXPIRED"
+    assert not client.busy

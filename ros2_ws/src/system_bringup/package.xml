@@ -8,6 +8,8 @@
   <buildtool_depend>ament_python</buildtool_depend>
   <exec_depend>gca_ros</exec_depend>
   <exec_depend>system_coordinator</exec_depend>
+  <exec_depend>gca_teleop</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <test_depend>python3-pytest</test_depend>

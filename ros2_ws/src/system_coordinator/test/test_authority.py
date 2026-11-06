@@ -69,3 +69,37 @@ def test_retired_source_can_be_recognized_without_resurrecting_control_or_affect
     with pytest.raises(SessionError, match="INVALID_RETIRED"):
         authority.verify_retired(old.session_id, old.generation, old.token)
     assert new.session_id != old.session_id
+
+
+def test_handover_alias_only_allows_same_owner_stop_until_ack():
+    import pytest
+    from system_coordinator.authority import SessionError, SourceAuthority
+
+    a = SourceAuthority(clock=lambda: 1.0)
+    s = a.claim("operator", "MANUAL", 4.0)
+    old = s.generation
+    a.rotate_generation(s)
+    assert a.verify_stop(s.session_id, old, s.token) is s
+    with pytest.raises(SessionError, match="STALE_GENERATION"):
+        a.verify(s.session_id, old, s.token)
+    a.acknowledge(s.session_id, s.generation, s.token)
+    with pytest.raises(SessionError):
+        a.verify_stop(s.session_id, old, s.token)
+
+
+def test_handover_timeout_and_new_owner_invalidate_old_stop():
+    import pytest
+    from system_coordinator.authority import SessionError, SourceAuthority
+
+    now = [1.0]
+    a = SourceAuthority(clock=lambda: now[0], handover_s=0.2)
+    s = a.claim("operator", "MANUAL", 4.0)
+    old = s.generation
+    a.rotate_generation(s)
+    now[0] = 1.3
+    with pytest.raises(SessionError):
+        a.verify_stop(s.session_id, old, s.token)
+    a.release()
+    a.claim("new", "MANUAL", 4.0)
+    with pytest.raises(SessionError):
+        a.verify_stop(s.session_id, s.generation, s.token)

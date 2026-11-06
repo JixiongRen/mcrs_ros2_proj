@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .manual import ManualInputQuality
+
 
 @dataclass(frozen=True)
 class OperationResult:
@@ -70,6 +72,7 @@ class JogCommand:
     ttl_s: float = 0.15
     deadman: bool = True
     admission_deadline_ns: int = 0
+    quality: ManualInputQuality | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,14 @@ class RuntimeState:
     requested_velocity_mm_s: float = 0.0
     applied_velocity_mm_s: float = 0.0
     dropped_records: int = 0
+    stop_serial: int = 0
+    input_valid_until_ns: int = 0
+    jog_linear_velocity_mm_s: float = 0.0
+    jog_rotation_velocity_deg_s: float = 0.0
+    rotation_planned_phase_deg: float = 0.0
+    rotation_rate_deg_s: float = 0.0
+    jog_velocity_error_mm_s: float = 0.0
+    jog_velocity_integral_mm_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -170,6 +181,8 @@ class PulseSegment:
     device_epoch: str
     command_id: str = ""
     expires_ns: int = 0
+    edge_offsets_us: tuple[int, ...] | None = None
+    stop_serial: int = 0
 
 
 @dataclass(frozen=True)

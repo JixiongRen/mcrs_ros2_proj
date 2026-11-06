@@ -9,7 +9,18 @@ import math
 import secrets
 import time
 from dataclasses import dataclass
+from functools import wraps
+from threading import RLock
 from typing import Callable
+
+
+def synchronized(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return guarded
 
 
 class AccessError(ValueError):
@@ -36,6 +47,7 @@ class LeaseAuthority:
     ):
         if not coordinator_key or not math.isfinite(maximum_s) or maximum_s <= 0:
             raise ValueError("coordinator key and positive finite maximum lease required")
+        self._lock = RLock()
         self._key = coordinator_key
         self._maximum = maximum_s
         self._clock = clock
@@ -43,6 +55,12 @@ class LeaseAuthority:
         self._retired: Grant | None = None
         self._retired_until = 0.0
 
+    @property
+    def transaction_lock(self):
+        """Protect authenticate-and-latch STOP against a concurrent new owner."""
+        return self._lock
+
+    @synchronized
     def issue(
         self,
         key: str,
@@ -78,6 +96,7 @@ class LeaseAuthority:
         self.grant = Grant(session_id, generation, issued, now + duration_s, sequence)
         return self.grant
 
+    @synchronized
     def verify(
         self, token: str, session_id: str, generation: int, allow_expired: bool = False
     ) -> Grant:
@@ -90,12 +109,14 @@ class LeaseAuthority:
             raise AccessError("SESSION_EXPIRED")
         return grant
 
+    @synchronized
     def revoke(self) -> None:
         if self.grant is not None:
             self._retired = self.grant
             self._retired_until = self._clock() + self._maximum
         self.grant = None
 
+    @synchronized
     def verify_retired(self, token, session_id, generation):
         """Only callers implementing stop or simulation-clear may use this path."""
         retired = self._retired
@@ -110,3 +131,15 @@ class LeaseAuthority:
         ):
             raise AccessError("INVALID_RETIRED_CAPABILITY")
         return retired
+
+    @synchronized
+    def coordinator_stop(self, key, session_id):
+        """Privileged stop bridge during executor-token handover; never enables."""
+        if not key or not secrets.compare_digest(key, self._key):
+            raise AccessError("UNAUTHORIZED_COORDINATOR")
+        known = self.grant or self._retired
+        if known is None or known.session_id != session_id:
+            raise AccessError("STOP_SESSION_MISMATCH")
+        if self.grant is None and self._clock() >= self._retired_until:
+            raise AccessError("INVALID_RETIRED_CAPABILITY")
+        return known

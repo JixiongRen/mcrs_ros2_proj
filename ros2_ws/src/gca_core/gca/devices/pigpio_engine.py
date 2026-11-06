@@ -15,6 +15,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 
+from gca.algorithms.pulse_timing import validate_edge_offsets
 from gca.domain.models import DeviceIdentity, PulseAbort, PulseCompletion, PulseSegment
 
 from .common import DeviceError, DeviceLock, PigpioConfig
@@ -115,6 +116,16 @@ class PigpioPulseEngine:
 
     def _wave(self, segment: PulseSegment):
         c = self.config
+        try:
+            edges = validate_edge_offsets(
+                segment,
+                high_us=c.high_us,
+                low_us=c.low_us,
+                setup_us=c.direction_setup_us,
+                hold_us=c.direction_hold_us,
+            )
+        except ValueError as exc:
+            raise DeviceError("PULSE_TIMING_INVALID", str(exc)) from exc
         count = abs(segment.signed_pulses)
         total_us = round(segment.duration_s * 1e6)
         available = total_us - c.direction_setup_us - c.direction_hold_us
@@ -130,6 +141,13 @@ class PigpioPulseEngine:
         direction_mask, pulse_mask = 1 << c.direction_gpio, 1 << c.pulse_gpio
         initial_on = direction_mask if level else 0
         initial_off = pulse_mask | (direction_mask if not level else 0)
+        if edges is not None:
+            waveform = [self.pulse_factory(initial_on, initial_off, edges[0])]
+            for index, edge in enumerate(edges):
+                following = edges[index + 1] if index + 1 < len(edges) else total_us
+                waveform.append(self.pulse_factory(pulse_mask, 0, c.high_us))
+                waveform.append(self.pulse_factory(0, pulse_mask, following - edge - c.high_us))
+            return waveform
         waveform = [self.pulse_factory(initial_on, initial_off, c.direction_setup_us)]
         base, remainder = divmod(available, count)
         for index in range(count):
@@ -171,12 +189,18 @@ class PigpioPulseEngine:
             self._call("wave_add_new")
             self._call("wave_add_generic", waveform)
             wave_id = self._call("wave_create")
-            # Preparation RPCs consume the original permit window. Recheck at
-            # the final motion-trigger boundary; never restart TTL after RPCs.
+            # Include the whole quantized waveform AND the declared worst-case
+            # send transaction. A host-side pre-send check without that budget
+            # could launch a finite wave whose tail crosses the original expiry.
+            # Real daemon/transport bounds remain subject to hardware HIL.
+            wave_duration_ns = round(segment.duration_s * 1e6) * 1000
+            trigger_budget_ns = math.ceil(c.socket_timeout_s * 1e9)
             if segment.expires_ns and (
-                self.clock() + round(segment.duration_s * 1e9) > segment.expires_ns
+                self.clock() + wave_duration_ns + trigger_budget_ns > segment.expires_ns
             ):
-                raise DeviceError("PULSE_EXPIRED", "pulse preparation consumed execution permit")
+                raise DeviceError(
+                    "PULSE_EXPIRED", "waveform and trigger budget exceed execution permit"
+                )
             send_attempted = True
             self._call("wave_send_once", wave_id)
             self._active, self._wave_id = segment, wave_id

@@ -38,3 +38,12 @@ float64 reference_rotation_rad
 float64 requested_velocity_m_s
 float64 applied_velocity_m_s
 uint64 output_seq
+# Manual control diagnostics; angular velocity is a software pulse estimate.
+uint64 stop_serial
+uint64 input_valid_until_ns
+float64 jog_linear_velocity_m_s
+float64 jog_rotation_velocity_rad_s
+float64 estimated_rotation_velocity_rad_s
+float64 rotation_planned_phase_rad
+float64 jog_velocity_error_m_s
+float64 jog_velocity_integral_m_s

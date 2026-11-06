@@ -61,3 +61,41 @@ def test_token_file_is_private_on_creation_and_atomic_replacement(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert json.loads(path.read_text())["token"] == "replacement-token"
     assert list(tmp_path.glob(".gca-session-*")) == []
+
+
+def test_programmed_jog_wire_quality_has_one_fixed_episode_and_restricted_release():
+    from types import SimpleNamespace
+
+    from gca_system_interfaces.msg import JogCommand
+
+    client = object.__new__(GcaClient)
+    client._lock = threading.RLock()
+    client.credentials = Credentials("programmed-session", 1, "source-token")
+    client.cleanup_errors = []
+    frames = []
+    client._jog_pub = SimpleNamespace(
+        publish=lambda message: frames.append(
+            deserialize_message(serialize_message(message), JogCommand)
+        )
+    )
+    client.motion_permit = lambda context, ttl: SimpleNamespace(token="source-token.nonce")
+    client.jog(linear_mm_s=1, rotation_deg_s=2, duration_s=0.11)
+    positive = [frame for frame in frames if frame.deadman]
+    assert len(positive) >= 2
+    assert len({frame.quality.input_epoch for frame in positive}) == 1
+    assert len({frame.quality.event_ns for frame in positive}) == 1
+    assert len({frame.quality.episode_end_ns for frame in positive}) == 1
+    assert all(frame.quality.source_kind == "PROGRAMMED_JOG" for frame in positive)
+    assert all(frame.quality.valid_until_ns <= frame.quality.episode_end_ns for frame in positive)
+    assert all(frame.quality.observation_ns < frame.quality.valid_until_ns for frame in positive)
+    assert [f.quality.observation_seq for f in positive] == list(range(1, len(positive) + 1))
+    assert not frames[-1].deadman
+    assert frames[-1].token == "source-token"
+    assert frames[-1].context.sequence > positive[-1].context.sequence
+
+
+@pytest.mark.parametrize("duration", [0, -1, 3600.001])
+def test_programmed_jog_rejects_out_of_policy_duration_before_any_rpc(duration):
+    client = object.__new__(GcaClient)
+    with pytest.raises(ValueError, match="duration_s must be within"):
+        client.jog(duration_s=duration)

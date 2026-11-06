@@ -1,10 +1,74 @@
 # 工程实现状态与证据
 
-**无硬件工程交付完成，最终统一软件验收通过。** 2026-11-05 14:14（Asia/Shanghai）完成：200项软件测试全部通过，0失败/错误/跳过；colcon包级177项全部通过（与200项重叠，不累加）；五包构建、独立普通安装、源码树外入口检查、5个真实ROS仿真场景及5个确定性模型场景均通过。命令、退出码和逐用例证据见下表。该结果不包含实机验收，也不消除下文已记录的调度限制。
+## 当前阶段：已暂停进一步验收
 
-本轮执行完整工程goal，设计原文保持在 [prebuild_docs](prebuild_docs/README.md)。所有已执行开发测试使用模拟设备或注入SDK／串口／波形客户端；没有打开真实串口、设置GPIO、启动实际波形或运动。**H01–H03全部NOT_RUN。**
+2026-11-06按用户要求停止追加与重复测试，转入项目总结和下一功能规划。后台验收在全新普通安装阶段收到SIGINT，子进程清理完成、无残留；不自动重启。当前源码指纹为 `5115a27789a5c119fb504e5ed52b2a6e5f38b3fb06ca768d8fa312af5b514153`。
 
-## 五阶段交付状态
+| 当前状态 | 已确认结果 |
+|---|---|
+| 已实现 | ROS 2手柄推进/旋转、同owner管理、输入质量/停车门控；独立于ROS的终端输入监视器 |
+| 当前构建与测试 | 静态检查、格式检查、六包构建通过；491项pytest与436项包级测试均0失败/错误/跳过，两组数量重叠 |
+| 本次修复 | 推进速度PI、旋转相位/有限边沿、输入原截止、STOP/ARM保护；追加修复心跳时间快照误判及owner/代次切换竞态 |
+| 独立手柄读取 | `python3 tools/joystick_monitor.py`无需ROS；加已标定profile显示LX/LY/LT/B、速度意图与门控原因，仅读取、不驱动执行器 |
+| 实体证据 | 15步只读映射通过；实体→simulation仅确认短暂推进，旋转及持续双轴操作未通过 |
+| 尚待验证 | 本次新源码的全新普通安装与完整DDS/模型复验未完成；无线资格、执行器H01–H03仍NOT_RUN |
+
+当前[验证报告](../artifacts/verification/latest/report.json)记录已通过步骤与用户主动中断，整体`passed=false`不代表491项测试失败，也不能写成整体验收通过。[暂停记录](../artifacts/joystick_monitor/current_verification.json)保留停止原因；[手柄操作指南](TELEOP_USER_GUIDE.md)给出独立脚本与ROS入口。后续只针对新功能及受影响接口做必要验证，完整回归留到发布或重要集成节点，不再为整理文档重复运行。
+
+## 历史已通过快照：手柄初版
+
+以下455项及其完整仿真结果属于2026-11-05快照，不覆盖之后的独立监视器与协调器修复；以首节作为当前状态。
+
+
+
+**该历史快照的无执行器硬件软件验收曾通过。** 2026-11-05 21:09（Asia/Shanghai）完成的统一运行包含455项必需软件测试、六包普通安装、旧仿真回归，以及手柄9个真实ROS/DDS场景和23个独立模型场景。实体完整映射已有只读证据；实体输入→simulation另行验证，无线资格及执行器H01–H03仍NOT_RUN。
+
+### 初版实现与历史证据
+
+`gca_teleop` 已实现只读joydev与显式合成源、严格profile、映射/门控、单一MANUAL owner、容量1异步派发、独立STOP本机代理与安装入口。正式路径不绕过协调器/双层许可。JF01–JF07已写入核心：外部编码器速度PI、真实dt/抗饱和、连续旋转phase/余量、初态、非均匀有限边沿、原输入截止及STOP/ARM闸门。源码与精确测试定位见 [追踪表](TELEOP_TRACEABILITY.md)，操作见 [手柄指南](TELEOP_USER_GUIDE.md)。
+
+| 本轮证据 | 实际结果与范围 |
+|---|---|
+| [统一验证报告](../artifacts/verification/pre-monitor-20261105T130942Z/report.json) | `passed=true`；10步退出码全为0；每步清理完成且无残留 |
+| [完整pytest](../artifacts/verification/pre-monitor-20261105T130942Z/pytest.xml) | 455项，0失败/错误/跳过；JUnit 166.667s，命令墙钟169.760s |
+| [colcon包级结果](../artifacts/verification/pre-monitor-20261105T130942Z/colcon-results.log) | 402项，0失败/错误/跳过；与455项重叠，不累加 |
+| [普通安装资源检查](../artifacts/verification/pre-monitor-20261105T130942Z/installed-resources.log) | 六包独立普通安装；源码树外检查安装模块、三个手柄入口、launch与配置，命令13.819s |
+| [旧仿真套件](../artifacts/simulation/pre-monitor-20261105T130942Z/report.json) | 5个真实ROS场景及5个独立模型场景均通过 |
+| [手柄完整套件](../artifacts/teleop/pre-monitor-20261105T130942Z/report.json) | 9个真实ROS/DDS场景全部通过，`full_acceptance=true`；[模型JUnit](../artifacts/teleop/pre-monitor-20261105T130942Z/model/junit.xml)23项全通过 |
+| [最终bootstrap复核](../artifacts/teleop_implementation/bootstrap-final/report.json) | 实际执行 `bash tools/bootstrap_dev.sh` 退出0，前后环境与依赖记录一致 |
+
+本次独立普通安装为 `artifacts/clean-install/20261105T125134568374Z/install`。统一源码清单 [sources.json](../artifacts/verification/pre-monitor-20261105T130942Z/sources.json) 的摘要为 `838e3e5e4ca9a49bc043eedb1b65d75f53029c35fd26076062a0ebb8c6c7b2cb`；验收期间源码与安装输入未变化。正式入口从工程根运行 `bash tools/verify_software.sh` 和 `bash tools/run_teleop_suite.sh --output artifacts/teleop/latest`。
+
+[独立模型报告](../artifacts/teleop/pre-monitor-20261105T130942Z/model/summary.json)使用teleop-controllability-v3：23场景覆盖正反推进、滑移、噪声/延迟、死区、饱和解除、细动/跨段旋转、失步对照和长期采样。长时场景实际运行两次1800s刺激，各再观察1.5s、保留18018行；0.1s采样及中立边界的哈希均为 `bc9c3ff88c23f9506b29018b11dfeab59e9b9af64fe3c8930aa942e72d717ebd`。最大30s周期线漂移约0.000397mm（门槛0.02mm），角漂移1脉冲；稳定后1s线漂移约3.95e-10mm，无失步plant与完成计数最大差约4.69e-12脉冲。这里是确定性模型时间与数值真值，不是Pi实时或机械精度实测。
+
+开发专项与失败现场保留在 `artifacts/teleop_implementation/`。核心teleop当前53项已包含在本次455项中，包括 [正负软限位及未结算预约4项专项](../artifacts/teleop_implementation/core/reservation_tests.xml)；早期49项、双60s或单次1800s快照不再用于证明本轮完整验收。独立plant的瞬态超调仍如实保留，不把稳态门槛通过写成无超调。
+
+统一验证中断时曾留下测试启动的独立ROS子组，现场已按身份清理并保留在 `artifacts/verification/pre-reservation-regression-20261105T1050Z/`。`tools/verify_software.py` 现通过本次命令的继承标识与PID/starttime跟踪后代，超时、中断或结束时进行有界清理；正常父进程退出但有残留也判验证失败。对应 [7项清理回归](../artifacts/teleop_implementation/verification-cleanup.xml) 已实际通过（0失败/错误/跳过，5.797s），覆盖独立子组、升级终止、不影响无关进程和身份边界。这些回归也已纳入本次455项统一验收；原专项报告保留供复核。
+
+已识别`20bc:506d`北通2.4GHz接收器，可读joydev。实体15步原始输入已采集，schema2映射重算复核PASS，证据和15份原始文件SHA见 [mapping.schema2.validation.json](../artifacts/teleop_implementation/input/physical_mapping/mapping.schema2.validation.json)。LX=0、LY=1且反向、LT=5、B=1；右侧预留axes[2,3,4]/buttons[7,14]，8/9未分配。该通过范围仅为真实只读映射。操作者明确表示模式不清楚，记录标签`operator_reported_unknown_2.4GHz`；无线资格仍NOT_RUN，默认未核实profile继续null锁定。实体输入→simulation首启因schema2重算约0.18–0.20s超过reader100ms预算而失败，未开始motion；[attempt1](../artifacts/teleop_implementation/input/physical_simulation.attempt1/report.json)现场保留。早先的后续尝试已结束，[report.json](../artifacts/teleop_implementation/input/physical_simulation/report.json)明确为passed=false / NOT_PASSED_NO_MOTION_OBSERVED：保留的输入raw最大event_seq=0、changed_frames=0，两个stage完整DDS的接受速度/编码器速度/脉冲均0。原因尚未确定，reader健康不证明无线在线。已显式STOP确认、release，launch退出0，errors=[]；输入日志有界轮转可能淘汰早期帧，完整observations.jsonl保留。清理成功不把未观察到动作改为通过。之后重新打开输入设备的 [LT初始状态快照](../artifacts/teleop_implementation/input/lt_held_snapshot.json) 读到轴5为+32767、附带按钮8为1，但event_seq=0且无变化事件；它只证明该次打开时的缓存基线，不能追溯证明上一轮已接收到按下事件或发生运动。右侧RT/RB/右杆只预留磁场，本轮没有磁场驱动或联合停机实现。
+
+第三轮 [physical_simulation.attempt3](../artifacts/teleop_implementation/input/physical_simulation.attempt3/report.json) 已关闭，结论为 `NOT_PASSED_OPERATOR_ACTION_UNCONFIRMED`：十分钟等待窗口结束前未收到所请求的LT完成回复，raw只有2个INIT基线、0个变化事件，DDS接受输出、编码器速度与确认脉冲均0。报告保留 `OPERATOR_WINDOW_EXPIRED_NO_ASSUMED_ACTION`，不能把经过时间当作用户已操作，也不能判实体运动通过。已确认STOP、接受release、launch退出0，所有该轮模拟ROS节点已关闭。
+
+随后两次只读采集均已关闭。[live_lt_probe](../artifacts/teleop_implementation/input/live_lt_probe/report.json) 只保存到4个LX变化，没有LT变化；[live_lt_probe_restart_1](../artifacts/teleop_implementation/input/live_lt_probe_restart_1/report.json) 共保存123个变化记录，其中实际LT新按达到+32767、再松开至−15540，归一化0.262871低于释放阈值0.4。此次只确认按下/释放阈值跨越，未在该次按下后观测到完全释放端点；不能把它扩展为运动链路或无线资格通过。
+
+第四轮 [实体输入→simulation报告](../artifacts/teleop_implementation/input/physical_simulation.attempt4/report.json) 已关闭，[分阶段评估](../artifacts/teleop_implementation/input/physical_simulation.attempt4/assessment.json) 为 `passed=false / NOT_PASSED_NO_MOTION_OBSERVED`：两个推进stage的接受速度、编码器速度及确认脉冲均0，保留的 [16个基线/变化帧](../artifacts/teleop_implementation/input/physical_simulation.attempt4/changed_input.jsonl) 无丢弃，关键观察也无丢弃。第一stage `physical_linear_forward` 记录LT新按seq4，约161ms后才观测到首个LY变化（reader观察时间差160.866216ms），已超过0.15s的event_age期限；第二stage `physical_linear_preposition` 虽收到用户完成回复，窗口内却没有真实变化事件。无变化不能证明无线在线，也不能判运动通过。STOP确认、release成功、launch退出0，errors为空只表示清理无报告错误，不改变未运动结论。
+
+[并行只读输入对照](../artifacts/teleop_implementation/input/parallel_input_probe.attempt2/report.json) 已关闭：[评估](../artifacts/teleop_implementation/input/parallel_input_probe.attempt2/assessment.json) 确认原始 `/dev/input/js0` 与安装后NativeJoydev各16个变化事件按序一致，包含B索引1的多次按放；errors为空、native_health_failures=0。用户已确认B按放完成，但指示灯状态仍未提供。event4/event5读取因权限不足而跳过，未修改权限。该对照只确认已收到事件的解析一致性，不测试运动，也不证明无线在线或无线资格。
+
+第五轮已关闭，[分阶段评估](../artifacts/teleop_implementation/input/physical_simulation.attempt5/assessment.json)保留650个基线/变化记录，变化与关键观察无丢弃，STOP/release成功、launch退出0。实体手柄确实触发了短暂模拟推进：接受输出最高1.6025722mm/s，编码器速度最高0.1322488mm/s，位置由0增至0.05mm，随后event_age到期停车。两次旋转试验已收到最高30°/s意图，但确认脉冲和模拟角度仍为0，整体标为`PARTIAL_BRIEF_LINEAR_MOTION_OBSERVED_ROTATION_NOT_CONFIRMED`，不判整体通过。最后一次旋转的DDS记录表明core在其最后接受的Jog期限到期后先进入STOPPING，teleop随后报告CONTEXT_CHANGED；更新的原始输入期限不证明已送达core。当前转入独立终端输入诊断，所有此次模拟节点和临时只读采集均已关闭。
+
+默认event_age静态长保持会到期并要求释放/回中/新LT；qualified_state需真实匹配资格，当前未启用实体资格。旋转意图为长期平均率，段内峰值/空档分列；未知abort作废旋转参考并锁住双轴手柄，需同owner显式恢复。有限profile软件时序通过不代表机械连续加速度、真实角度或停止距离通过。
+
+## 历史无硬件工程基线（本轮手柄改动前）
+
+上一阶段无硬件工程基线曾通过： 2026-11-05 14:14（Asia/Shanghai）完成：200项软件测试全部通过，0失败/错误/跳过；colcon包级177项全部通过（与200项重叠，不累加）；五包构建、独立普通安装、源码树外入口检查、5个真实ROS仿真场景及5个确定性模型场景均通过。命令、退出码和逐用例证据见下表。该历史结果不包含实机验收，不覆盖本轮JF手动Jog扩展，也不消除已记录的调度限制。
+
+上一阶段执行完整工程goal，设计原文保持在 [prebuild_docs](prebuild_docs/README.md)。所有已执行开发测试使用模拟设备或注入SDK／串口／波形客户端；没有打开真实串口、设置GPIO、启动实际波形或运动。**H01–H03全部NOT_RUN。**
+
+
+以下五阶段表、200项及对应源码指纹为上一阶段记录，保留用于理解B01–B20/T01–T18和历史调度限制。**下表的latest路径现已被本轮运行覆盖/更新，不再是旧200项或旧指纹的归档证据。** 旧数字仅保留为上一阶段的文字记录；不要用本轮新报告反向支撑旧200数字。当前本轮最终结果只在本文首节由最终报告确认，不能把历史通过推广到新增手柄。
+
+## 上一阶段五阶段交付状态
 
 | 阶段 | 实际已落地内容 | 当前验证/边界 |
 |---|---|---|
@@ -16,7 +80,7 @@
 
 环境基线已重新检查：Pi 4B／ARM64／Ubuntu24.04／Python3.12／ROS2 Jazzy。项目使用`.venv`和经PyPI哈希核对的固定pip wheel引导，补充依赖包括DYNAMIXEL SDK4.1.0、pigpio1.78及ruff；系统Python与legacy不改写。实际版本见 [环境记录](../artifacts/environment.json)。导入库不代表打开硬件。
 
-## 已有开发证据与统一验收入口
+## 上一阶段开发证据与统一验收入口
 
 | 证据 | 位置/实际结果 | 如何解释 |
 |---|---|---|
@@ -31,7 +95,7 @@
 | 最终仿真套件 | [simulation/latest/report.json](../artifacts/simulation/latest/report.json)及各场景子目录 | 5个ROS场景及5个模型场景全部PASS；各CLI和launch均退出0 |
 | 独立普通安装 | `artifacts/clean-install/20261105T060700711551Z/install`、[资源检查日志](../artifacts/verification/latest/installed-resources.log) | 普通构建退出0，用时369.40s；源码树外只加载该install，五包、CLI、launch和配置资源均PASS |
 
-最终源码指纹为 `4b007c29b3226d9ef2a9e5654fd95db9d6b0f275948574022768828fc01128b2`，逐文件哈希见 [sources.json](../artifacts/verification/latest/sources.json)。统一工具已检查验收期间源码未变化。basic场景目标为5 mm/20°，最终推进反馈5.01 mm、旋转脉冲估计19.985625°；这是模型运行结果，不是实机精度。主入口均从工程根运行：
+上一阶段验收的文字记录指纹为 `4b007c29b3226d9ef2a9e5654fd95db9d6b0f275948574022768828fc01128b2`；当前 [sources.json](../artifacts/verification/latest/sources.json) 已随本轮更新，不能作为这份旧指纹的逐文件证据。统一工具已检查验收期间源码未变化。basic场景目标为5 mm/20°，最终推进反馈5.01 mm、旋转脉冲估计19.985625°；这是模型运行结果，不是实机精度。主入口均从工程根运行：
 
 ```bash
 bash tools/bootstrap_dev.sh
@@ -129,6 +193,8 @@ bash tools/run_simulation_suite.sh --output artifacts/simulation/latest
 
 ### 调度观测与明确限制
 
+本轮一次完整pytest记录为455项：447通过、3失败、5错误、0跳过，失败集中于ROS启动/状态发现、CLI运动启动、短进程握手及无效配置启动超时；现场保存在 [host-pressure归档](../artifacts/verification/host-pressure-20261105T2036Z/report.json)。同时观测到可用内存偏低、Pylance约占一半RAM，见 [现场快照](../artifacts/teleop_implementation/host_pressure/observed.json)。工作区 [.vscode/settings.json](../.vscode/settings.json) 仅为Python分析排除生成的artifacts、build、install、log目录；随后 [快照](../artifacts/teleop_implementation/host_pressure/after_excludes.json) 显示可用内存回升。相同代码、原断言与原超时下，8个失败/错误用例 [复测全部通过](../artifacts/teleop_implementation/host_pressure/recheck/pytest.xml)（60.390s，命令墙钟66.453s），[命令记录](../artifacts/teleop_implementation/host_pressure/recheck/report.json)已保留。没有终止用户IDE进程；这些关联观察不能确定每项失败的全部根因，也不能把447与8拼成整套PASS；之后本文首节所列的新统一运行独立通过，不能据此宣称最坏宿主调度性能已验证。
+
 一次完整测试重跑在遥测阻塞场景出现约278 ms的控制/采样共同调度暂停，触发 `FEEDBACK_STALE`，随后确认停止。现场及199通过/1失败结果保存在 [历史失败证据](../artifacts/verification/development-telemetry-failure/report.json)。三次原期限定点复测均通过，控制记录最大间隔分别约23.37、20.55、22.37 ms，见 [诊断汇总](../artifacts/diagnostics/telemetry-scheduler/summary.json)；**未复现不等于已修复，暂停来源仍未确定**。该记录不支持硬实时或最坏停止时间保证。
 
 本地输出TTL与过期反馈停车规则未放宽。当前Python/普通Linux部署在调度暂停时可能使任务失败并停车；实际负载下的运行连续性和停止性能仍需H03测量。后来另修正了原始控制记录中反馈年龄/租约剩余时间未更新的问题：日志与其单调时间戳对应，ROS快照仍在读取时重算年龄；冻结反馈回归核对日志时间差。集成测试在失败时也释放自身注入的遥测暂停，避免清理警告掩盖主要故障。
@@ -145,6 +211,6 @@ bash tools/run_simulation_suite.sh --output artifacts/simulation/latest
 
 ## 交付范围与后续工作
 
-本轮必需的软件构建、安装、测试、仿真及文档工作均完成。历史失败保留，最终通过不代表已确定所有宿主调度暂停的原因；上文调度限制仍有效。之后修改源码、配置或依赖，应重新运行统一验证并形成新的指纹和报告。
+上一阶段必需的软件构建、安装、测试、仿真及文档工作已有历史通过记录。本轮手柄扩展和JF01–JF07已实现，完整软件回归、普通安装及全路径仿真均已通过，具体证据见本文开头。历史失败保留，既有通过不代表已确定所有宿主调度暂停的原因；上文调度限制仍有效。之后修改源码、配置或依赖，应重新运行统一验证并形成新的指纹和报告。
 
-后续需按实物资料完成H01–H03，确认实际设备、接线、比例、波形和停止性能后再启用hardware。Windows磁驱动、联合实验、实体手柄适配、跨机DDS权限策略、视觉/力反馈等仍是明确的扩展范围，当前GCA-only不会代替这些能力。
+后续需按实物资料完成H01–H03，确认实际设备、接线、比例、波形和停止性能后再启用hardware。实体只读映射已通过；实体输入→simulation仅确认短暂推进，旋转与持续双轴控制未通过，无线资格仍NOT_RUN。Windows磁驱动、联合实验、无线资格验收、跨机DDS权限策略、视觉/力反馈等仍是明确的后续范围，当前GCA-only不会代替这些能力。

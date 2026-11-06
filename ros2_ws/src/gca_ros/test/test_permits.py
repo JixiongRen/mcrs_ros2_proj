@@ -73,3 +73,22 @@ def test_logical_goal_identity_ignores_authentication_and_admission_budget():
     fresh.target.linear_m = goal.target.linear_m
     fresh.execution_timeout_s = 21.0
     assert not same_motion_payload(goal, fresh)
+
+
+def test_stop_fence_revokes_unused_and_already_issued_nonces():
+    from types import SimpleNamespace
+
+    import pytest
+    from gca_ros.permits import MotionPermits, PermitError
+
+    p = MotionPermits(clock=lambda: 1.0)
+    context = SimpleNamespace(session_id="s", generation=1, sequence=4, command_id="c", task_id="t")
+    nonce, _ = p.issue("cap", context, 0.1, 2.0)
+    stop = SimpleNamespace(session_id="s", generation=1, sequence=5)
+    p.fence(stop)
+    with pytest.raises(PermitError, match="STOP_FENCED"):
+        p.consume(nonce, context)
+    with pytest.raises(PermitError, match="STOP_FENCED"):
+        p.issue("cap", context, 0.1, 2.0)
+    context.sequence = 6
+    assert p.issue("cap", context, 0.1, 2.0)[0]

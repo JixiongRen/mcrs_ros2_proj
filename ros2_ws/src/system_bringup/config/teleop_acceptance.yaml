@@ -1,0 +1,47 @@
+# Declared before acceptance runs. These limits are for synthetic models only.
+criterion_version: teleop-controllability-v3
+seed: 7
+linear:
+  targets_mm_s: [-2.0, 2.0]
+  slip_fractions: [0.0, 0.10, 0.25]
+  settle_s: 2.0
+  window_s: 0.5
+  relative_error: 0.05
+  quantization_counts: 2
+  neutral_observation_s: 1.0
+  neutral_drift_counts: 2
+  noise_mm: 0.005
+  encoder_delay_s: 0.02
+  noisy_window_s: 1.0
+  noisy_extra_error_mm_s: 0.02
+  deadband_mm_s: [0.01, 0.5]
+  deadband_targets_mm_s: [-0.25, 0.25]
+  saturation_limit_mm_s: 1.0
+  saturation_release_s: 1.0
+  saturation_recovery_s: 2.0
+  saturation_integral_recovery_mm_s: 0.1
+rotation:
+  fine_deg_s: 0.1
+  fine_duration_s: 10.0
+  cumulative_error_pulses: 1
+  normal_targets_deg_s: [-30.0, 30.0]
+  relative_rate_error: 0.05
+  quantization_pulses: 2
+  missed_step_fraction: 0.25
+long_model_duration_s: 1800.0
+long_model:
+  common_period_s: 30.0
+  first_steady_cycle: 1
+  linear_drift_counts_per_cycle: 2
+  rotation_drift_pulses_per_cycle: 1
+  count_truth_error_pulses: 1
+  final_settle_s: 0.5
+  repeat_runs: 2
+ros:
+  startup_timeout_s: 20.0
+  management_timeout_s: 6.0
+  stop_observation_timeout_s: 2.0
+  post_stop_observation_s: 0.5
+  input_max_age_s: 0.15
+  reader_timeout_s: 0.10
+  dispatch_hz: 25.0

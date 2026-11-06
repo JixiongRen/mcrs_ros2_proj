@@ -1,5 +1,5 @@
 [tool.pytest.ini_options]
-testpaths = ["tests", "ros2_ws/src/gca_core/test", "ros2_ws/src/gca_ros/test", "ros2_ws/src/system_coordinator/test", "ros2_ws/src/system_bringup/test"]
+testpaths = ["tests", "ros2_ws/src/gca_core/test", "ros2_ws/src/gca_ros/test", "ros2_ws/src/system_coordinator/test", "ros2_ws/src/system_bringup/test", "ros2_ws/src/gca_teleop/test"]
 addopts = "-ra"
 markers = [
   "integration: launches isolated ROS processes with simulated devices",

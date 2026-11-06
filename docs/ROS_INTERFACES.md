@@ -8,6 +8,7 @@
 |---|---|---|
 | `/system/claim_control` | `ControlSession` service | 客户端领取唯一源会话，选择 AUTO／MANUAL／MAINTENANCE |
 | `/system/renew_control` | `ControlSession` service | 同会话、同代次、递增序号续租 |
+| `/system/acknowledge_generation` | `ControlSession` service | 当前owner确认ARM后的新代次，收回交接期受限STOP别名 |
 | `/system/release_control` | `ControlSession` service | 撤销源会话及设备许可，触发停止 |
 | `/system/get_motion_permit` | `ControlSession` service | 给一个命令上下文签发固定截止时间的一次性准入许可 |
 | `/system/execute_motion` | `ExecuteMotion` action | 单轴／双轴绝对或相对定位 |
@@ -25,6 +26,7 @@
 | `/gca/{apply_config,get_command_status,inject_fault}` | 对应同名 IDL service | 设备端配置、查询及模拟故障 |
 | `/gca/get_capabilities` | `GetCapabilities` service | 后端、可用能力、限制、未验证项 |
 | `/gca/state` | `GcaState` topic | 带质量、年龄、版本和停止证据的状态 |
+| `/teleop/state` | `TeleopState` topic | 输入门控/质量、会话状态、意图/已接受速度与有界派发队列；不含凭证 |
 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | 故障、版本与记录丢样／写盘错误 |
 | `/gca_control_node/*` | 标准 Lifecycle／参数服务 | configure／activate／deactivate／cleanup，均不隐式ARM |
 
@@ -75,6 +77,7 @@ ROS Action 状态和业务结果需要一起读。例如授权过期导致中止
 | `/gca/state`、`/system/state` | KEEP_LAST(1)、RELIABLE、TRANSIENT_LOCAL；只保存最新快照 |
 | Jog topics | KEEP_LAST(1)、RELIABLE、VOLATILE；本地输入期限仍是有效性依据 |
 | Action／Service | 标准可靠交互，应用等待有截止时间 |
+| `/teleop/state` | `TeleopState` topic | 输入门控/质量、会话状态、意图/已接受速度与有界派发队列；不含凭证 |
 | `/diagnostics` | 有界浅队列；不参与闭环 |
 | 本地速度需求 | 容量1；旧需求覆盖，但不能覆盖独立STOP撤销 |
 | 关键I/O回执／结果 | 有界；溢出故障锁存并作废不再可信的计数证据 |
@@ -88,3 +91,22 @@ NOT_ARMED、NOT_ACTIVE、CONTROL_BUSY 表示前置状态不满足；INVALID_TOKE
 业务会话不是 DDS 身份认证。默认只发现本机节点，ROS_DOMAIN_ID 也不是安全机制。原生 CancelGoal 没有自定义 token 字段，同一可信 ROS 图中的客户端可能调用它；硬件部署必须使用受控主机账户并显式声明可信本机，或配置并强制 DDS Security。跨机权限策略不属于已经验收的本轮功能。故障注入只在模拟后端开启。
 
 撤销后只保留最后一个已认证会话的短期限受限管理记录，用于 STOP／DISARM／释放，以及 simulation 中清除故障注入。它不能续租、ARM、申请运动许可或设置参考／配置；出现新控制者后，旧记录立即不能影响新控制者。故障锁存仍只由显式 RESET 清除，普通停车不恢复运动授权。
+
+## 手动输入质量与STOP屏障
+
+`JogCommand.quality` 使用 `ManualInputQuality`：`source_kind/source_id/input_epoch` 标识来源；`event_seq/event_ns/event_time_source` 保留事件时间；`observation_seq/observation_ns` 表示真实reader观察进展；`valid_until_ns` 是固定原截止；`clock_domain_id` 为实际Linux boot ID，首期只比较同Pi同boot单调时间。`qualification_id/link_evidence` 标记资格依据；`episode_end_ns` 固定程序Jog的一次总时段。
+
+| source_kind | 期限与准入 |
+|---|---|
+| EVENT_AGE | 真实GCA变化事件年龄；静态握持、右侧变化和心跳不能延期 |
+| QUALIFIED_STATE_CONTRACT | 资格记录匹配的reader观察；不是新无线报告或任意RF故障检测保证 |
+| SCRIPT_SAMPLE | 明确合成样本，仅simulation |
+| PROGRAMMED_JOG | 旧CLI jog(duration)的一次固定episode，后续帧不延长终点 |
+
+active Jog缺质量返回 `MANUAL_QUALITY_REQUIRED`；错误boot/未来或过期时间、回退序号、旧epoch重放及越过history容量均失败关闭。相同真实观察可携带递增命令seq，但固定截止不得改变。权限退休清理对应质量历史；普通STOP不清历史，避免旧epoch绕过。deadman=false保留受限停车路径。
+
+每层取输入原截止、一次性nonce、租约和本地输出TTL的最小值；有限波形须整段落入该窗口，pigpio准备完成后发送前再次核验。控制线程冻结不让I/O获得now+TTL的新期限。`GcaState`新增 `stop_serial/input_valid_until_ns`、Jog受限速度、速度误差/积分和旋转相位/计划率；其中角速度仍是软件估计，不是机械角测量。
+
+B、deadman释放和管理STOP在等待许可前清容量1待发槽并提升Jog epoch/停止闸门。seq≤STOP屏障的请求、旧许可与迟到ARM都不能复活；最终enable/速度写入/有限submit与serial串行化。跨代STOP别名仅限相同owner的受限交接期，不能用于续租、ARM、参考或普通运动；新owner出现后旧owner无权影响它。
+
+本机 `gca_teleop_cli` 不额外claim ROS源会话；它经私有Unix socket请求既有owner执行管理，携带owner_instance、input_epoch、session/generation、reference/config预期上下文并去重。STOP使用独立socket/工作队列，只比较仍属当前owner/输入的停止必要上下文，避免慢ARM或配置变化使B失效。它是同用户本机接口，不提供跨机身份认证。完整命令见 [手柄指南](TELEOP_USER_GUIDE.md)。

@@ -1,0 +1,25 @@
+# Model-only calibration; never valid evidence for a physical controller.
+source: scripted
+profile_id: synthetic-v1
+mode: event_age
+device:
+  device_mode: synthetic
+mapping:
+  lx: {index: 0, minimum: -32768, center: 0, maximum: 32767, sign: 1}
+  ly: {index: 1, minimum: -32768, center: 0, maximum: 32767, sign: -1}
+  lt: {index: 2, released: -32768, pressed: 32767}
+  b_button: 1
+  reserved_axes: [3, 4, 5]
+  reserved_buttons: [5, 9]
+script_file: synthetic_idle.json
+dispatch_hz: 25.0
+reader_timeout_s: 0.10
+input_max_age_s: 0.15
+poll_timeout_s: 0.02
+deadzone: 0.08
+response_exponent: 1.5
+lt_press: 0.6
+lt_release: 0.4
+max_linear_mm_s: 2.0
+max_rotation_deg_s: 30.0
+seed: 7

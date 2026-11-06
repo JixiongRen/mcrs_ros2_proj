@@ -55,3 +55,21 @@ def test_retired_executor_capability_only_exists_without_a_new_owner_and_expires
     clock[0] = 7.0
     with pytest.raises(AccessError, match="INVALID_RETIRED"):
         authority.verify_retired(new.token, "new", 2)
+
+
+def test_privileged_stop_bridge_spans_same_session_handover_but_not_new_owner():
+    import pytest
+    from gca_ros.security import AccessError, LeaseAuthority
+
+    a = LeaseAuthority("coordinator-key", clock=lambda: 1.0)
+    old = a.issue("coordinator-key", "first", 1, 1, 1.0)
+    a.revoke()
+    assert a.coordinator_stop("coordinator-key", "first") == old
+    new = a.issue("coordinator-key", "first", 2, 2, 1.0)
+    assert a.coordinator_stop("coordinator-key", "first") == new
+    with pytest.raises(AccessError, match="UNAUTHORIZED_COORDINATOR"):
+        a.coordinator_stop("wrong-key", "first")
+    a.revoke()
+    a.issue("coordinator-key", "second", 3, 1, 1.0)
+    with pytest.raises(AccessError, match="STOP_SESSION_MISMATCH"):
+        a.coordinator_stop("coordinator-key", "first")

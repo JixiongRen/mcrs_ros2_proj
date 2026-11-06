@@ -21,9 +21,13 @@ from uuid import uuid4
 
 from gca.acquisition.buffers import Latest
 from gca.algorithms.control import PositionController, boundary_velocity, clamp, slew
+from gca.algorithms.jog_rotation import JogRotationPlanner
+from gca.algorithms.jog_velocity import JogVelocityController
 from gca.algorithms.trajectory import PulseQuantizer, Trapezoid
 from gca.config import RuntimeConfig
+from gca.domain.manual import QualityTracker
 from gca.domain.models import (
+    CommandContext,
     DeviceError,
     JogCommand,
     Lease,
@@ -50,6 +54,7 @@ class _Demand:
     generation: int
     expires_ns: int
     feedback_ns: int
+    stop_serial: int = 0
 
 
 class ControlRuntime(DeviceIOOwners):
@@ -95,6 +100,8 @@ class ControlRuntime(DeviceIOOwners):
         self._stop_request = None
         self._stop_serial = 0
         self._handled_stop_serial = 0
+        self._stop_fences = OrderedDict()
+        self._armed_stop_serial = 0
         self._commands = Queue(self.config.queue_capacity)
         self._io_events = Queue(self.config.queue_capacity)
         self._results = deque()
@@ -143,6 +150,24 @@ class ControlRuntime(DeviceIOOwners):
         self._quantizer = PulseQuantizer(
             self.config.pulses_per_motor_rev, self.config.catheter_per_motor_ratio
         )
+        self._jog_velocity = JogVelocityController(
+            self.config.jog_velocity_kp,
+            self.config.jog_velocity_ki,
+            self.config.jog_velocity_kaw,
+            self.config.jog_integral_limit_mm_s,
+            self.config.jog_velocity_filter_s,
+            self.config.jog_dt_max_s,
+        )
+        self._jog_rotation = JogRotationPlanner(self.config, self._quantizer)
+        self._quality_tracker = QualityTracker(
+            backend=self.config.backend, max_age_s=self.config.manual_input_max_age_s
+        )
+        self._input_deadline = 0
+        self._jog_updated_ns = 0
+        self._jog_feedback_ns = 0
+        self._jog_feedback_seq = 0
+        self._jog_last_desired = 0.0
+        self._jog_feedback_retarget = False
         self._history, self._fingerprints, self._highwater = OrderedDict(), {}, {}
         self._revoked_generations = OrderedDict()
         self._reservation = None
@@ -231,7 +256,7 @@ class ControlRuntime(DeviceIOOwners):
             return OperationResult(False, "NOT_RUNNING")
         done, holder = Event(), []
         try:
-            self._commands.put_nowait((kind, value, done, holder))
+            self._commands.put_nowait((kind, value, done, holder, self.stop_serial))
         except Full:
             return OperationResult(False, "QUEUE_FULL")
         self._wake.set()
@@ -250,14 +275,20 @@ class ControlRuntime(DeviceIOOwners):
 
     set_active = activate
 
-    def arm(self, lease: Lease) -> OperationResult:
+    @property
+    def stop_serial(self) -> int:
+        """Monotonic stop transaction fence; callers capture before ARM awaits."""
+        return self._stop_serial
+
+    def arm(self, lease: Lease, expected_stop_serial: int | None = None) -> OperationResult:
         """Grant a verified executor lease in seconds while active/DISARMED.
 
         The host authenticates Lease before this call. The control owner stores
         its local deadline/token and rejects revoked generations or wrong state;
         actual device enable remains exclusively in the I/O owner.
         """
-        return self._invoke("arm", lease)
+        expected = self.stop_serial if expected_stop_serial is None else expected_stop_serial
+        return self._invoke("arm", (lease, expected))
 
     def renew(self, lease: Lease) -> OperationResult:
         """Queue a same-session/token/generation renewal with increasing seq.
@@ -296,7 +327,12 @@ class ControlRuntime(DeviceIOOwners):
         return self._invoke("motion", command)
 
     def stop(
-        self, reason: str = "STOP", command_id: str = "", disarm: bool = False
+        self,
+        reason: str = "STOP",
+        command_id: str = "",
+        disarm: bool = False,
+        *,
+        context: CommandContext | None = None,
     ) -> OperationResult:
         """Immediately revoke output and latch a bounded stop outside FIFO.
 
@@ -312,17 +348,34 @@ class ControlRuntime(DeviceIOOwners):
         active = self._motion or self._hold
         if command_id and active and active.context.command_id != command_id:
             return OperationResult(False, "COMMAND_MISMATCH")
+        if (
+            context is not None
+            and self._lease is not None
+            and (
+                context.session_id != self._lease.session_id
+                or context.generation != self._lease.generation
+            )
+        ):
+            return OperationResult(False, "INVALID_PERMISSION")
+        self._latch_stop(reason, command_id, disarm, context)
+        return OperationResult(True, "STOP_ACCEPTED")
+
+    def _latch_stop(self, reason, command_id="", disarm=False, context=None):
         self._permit = False
         self._pulse_stop.set()
         self._velocity_demand.put(None)
         # An independent latch cannot be crowded out by ordinary commands.
         with self._stop_lock:
+            if context is not None:
+                key = (context.session_id, context.generation)
+                self._stop_fences[key] = max(context.sequence, self._stop_fences.get(key, -1))
+                while len(self._stop_fences) > self.config.history_capacity:
+                    self._stop_fences.popitem(last=False)
             if self._stop_request:
                 disarm = disarm or self._stop_request[2]
             self._stop_serial += 1
             self._stop_request = (reason, command_id, disarm, self._stop_serial)
         self._wake.set()
-        return OperationResult(True, "STOP_ACCEPTED")
 
     def disarm(self) -> OperationResult:
         """Latch stop plus permission withdrawal; inspect stop evidence later."""
@@ -406,6 +459,7 @@ class ControlRuntime(DeviceIOOwners):
         result = replace(
             state,
             sample_age_s=age,
+            stop_serial=self.stop_serial,
             lease_remaining_s=max(0.0, (self._lease_deadline - now) / 1e9),
             linear_valid=state.linear_valid and age <= self.config.feedback_max_age_s,
         )
@@ -447,6 +501,68 @@ class ControlRuntime(DeviceIOOwners):
         return OperationResult(bool(status), status or "UNKNOWN_COMMAND")
 
     command_status = get_command_status
+
+    def simulation_evidence(self) -> dict[str, object]:
+        """Observe accepted simulated I/O independently from the control writer.
+
+        Never advances the plant, polls a device, or takes a control/STOP lock.
+        The plant snapshot is internally consistent; mutable ingress metadata
+        is bracketed and marked unavailable if it changes during observation.
+        This is simulation truth, never evidence of physical hardware feedback.
+        """
+        if self.config.backend != "simulation" or getattr(self, "plant", None) is None:
+            return {"available": False, "evidence_kind": "SIMULATION_ONLY"}
+        result = {
+            "available": False,
+            "sampled_ns": self.clock(),
+            "evidence_kind": "SIMULATED_ACCEPTED_IO_AND_PLANT",
+        }
+        before = (
+            self._output_generation,
+            self._output_seq,
+            self._input_deadline,
+            self._jog_deadline,
+            self.stop_serial,
+        )
+        if not self.plant.lock.acquire(blocking=False):
+            return dict(result, reason="PLANT_SNAPSHOT_BUSY")
+        try:
+            plant = self.plant.snapshot()
+            plant_updated = self.plant._now
+        finally:
+            self.plant.lock.release()
+        demand = self._velocity_demand.get()
+        active = self.pulse._active  # SimPulseEngine immutable finite-segment reference.
+        result.update(
+            plant_position_mm=plant.position_mm,
+            plant_velocity_mm_s=plant.velocity_mm_s,
+            plant_angle_deg=plant.mechanical_angle_deg,
+            accepted_velocity_mm_s=plant.accepted_velocity_mm_s,
+            plant_updated_ns=plant_updated,
+            servo_enabled=bool(self.servo.enabled),
+            pulse_idle=active is None,
+            pulse_active_expires_ns=active.expires_ns if active is not None else 0,
+            demand_expires_ns=demand.expires_ns if demand is not None else 0,
+            demand_seq=demand.seq if demand is not None else 0,
+            control_state_seq=self._state.state_seq,
+            control_paused=self._control_paused.is_set(),
+            output_generation=before[0],
+            output_seq=before[1],
+            input_valid_until_ns=before[2],
+            jog_valid_until_ns=before[3],
+            stop_serial=before[4],
+        )
+        after = (
+            self._output_generation,
+            self._output_seq,
+            self._input_deadline,
+            self._jog_deadline,
+            self.stop_serial,
+        )
+        result["available"] = before == after
+        if not result["available"]:
+            result["reason"] = "INGRESS_CHANGED_DURING_SNAPSHOT"
+        return result
 
     def records(self) -> list[dict[str, object]]:
         """Copy bounded structured control records without disk I/O.
@@ -518,15 +634,20 @@ class ControlRuntime(DeviceIOOwners):
             self._stop_request = None
         if stop_request:
             reason, _, disarm, serial = stop_request
-            self._begin_stop(reason, disarm=disarm)
+            self._begin_stop(reason, disarm=disarm, serial_already_set=True)
             self._handled_stop_serial = serial
         try:
             while True:
-                kind, value, done, holder = self._commands.get_nowait()
+                request = self._commands.get_nowait()
+                kind, value, done, holder = request[:4]
+                serial = request[4] if len(request) > 4 else self.stop_serial
                 if done.is_set():
                     continue
                 try:
-                    result = self._handle(kind, value, self.clock())
+                    if kind in ("arm", "jog", "motion", "reserve") and serial != self.stop_serial:
+                        result = OperationResult(False, "STOP_SUPERSEDED")
+                    else:
+                        result = self._handle(kind, value, self.clock())
                 except Exception as exc:
                     result = OperationResult(
                         False, getattr(exc, "code", "INVALID_ARGUMENT"), str(exc)
@@ -606,6 +727,15 @@ class ControlRuntime(DeviceIOOwners):
                 output_generation=self._output_generation,
                 output_seq=self._output_seq,
                 state_seq=self._state.state_seq + 1,
+                stop_serial=self.stop_serial,
+                input_valid_until_ns=self._input_deadline if self._jog else 0,
+                jog_linear_velocity_mm_s=self._jog_velocity.target if self._jog else 0.0,
+                jog_rotation_velocity_deg_s=self._jog_rotation.commanded_rate if self._jog else 0.0,
+                rotation_planned_phase_deg=self._rotation_offset
+                + self._jog_rotation.reference_phase / self._quantizer.pulses_per_deg,
+                rotation_rate_deg_s=self._jog_rotation.wave_rate if self._jog else 0.0,
+                jog_velocity_error_mm_s=self._jog_velocity.error if self._jog else 0.0,
+                jog_velocity_integral_mm_s=self._jog_velocity.integral if self._jog else 0.0,
             )
             if len(self._records) == self._records.maxlen:
                 self._dropped_records += 1
@@ -620,6 +750,8 @@ class ControlRuntime(DeviceIOOwners):
                     seq, generation, velocity = value
                     if generation == self._output_generation:
                         self._pid.applied(seq, generation, velocity)
+                        if self._jog:
+                            self._jog_velocity.applied(seq, generation, velocity)
                         self._diagnostics.update(
                             receipt_output_seq=seq,
                             receipt_output_generation=generation,
@@ -681,6 +813,8 @@ class ControlRuntime(DeviceIOOwners):
                         if self._pending_segment == segment_id:
                             self._pending_segment = None
                             self._reserved_pulses = 0
+                elif kind == "jog_expired":
+                    self._begin_stop("JOG_EXPIRED")
                 elif kind == "fault":
                     self._begin_stop(value, fault=True)
                 elif kind == "stop_unknown":
@@ -724,6 +858,8 @@ class ControlRuntime(DeviceIOOwners):
         if command.admission_deadline_ns and now >= command.admission_deadline_ns:
             return OperationResult(False, "COMMAND_EXPIRED")
         context = command.context
+        if context.sequence <= self._stop_fences.get((context.session_id, context.generation), -1):
+            return OperationResult(False, "STOP_FENCED")
         if not all(
             isinstance(v, str) and 0 < len(v) <= 128
             for v in (context.session_id, context.task_id, context.command_id)
@@ -807,6 +943,13 @@ class ControlRuntime(DeviceIOOwners):
                 self._begin_stop("DEACTIVATE", disarm=True)
             return OperationResult(True)
         if kind in ("arm", "renew"):
+            expected = self.stop_serial
+            if kind == "arm" and isinstance(value, tuple):
+                value, expected = value
+            if kind == "arm" and (type(expected) is not int or expected < 0):
+                return OperationResult(False, "INVALID_ARGUMENT")
+            if kind == "arm" and expected != self.stop_serial:
+                return OperationResult(False, "STOP_SUPERSEDED")
             result = self._validate_lease(value, now, renewal=kind == "renew")
             if not result.accepted:
                 return result
@@ -828,6 +971,7 @@ class ControlRuntime(DeviceIOOwners):
                     session_id=value.session_id,
                     error_code="",
                 )
+                self._armed_stop_serial = expected
             self._lease = value
             self._lease_deadline = now + int(value.ttl_s * 1e9)
             return OperationResult(True, token=value.token)
@@ -934,6 +1078,7 @@ class ControlRuntime(DeviceIOOwners):
                     + self._quantizer.angle(self._confirmed_pulses),
                 )
             self._motion, self._reservation, self._motion_started = command, None, now
+            self._armed_stop_serial = self.stop_serial
             self._hold = self._jog = None
             self._pid.reset()
             self._output_generation += 1
@@ -1071,10 +1216,13 @@ class ControlRuntime(DeviceIOOwners):
                 self._lease.generation, self._revoked_generations.get(session, -1)
             )
             self._revoked_generations.move_to_end(session)
+            self._quality_tracker.clear_session(session, self._lease.generation)
             while len(self._revoked_generations) > self.config.history_capacity:
                 self._revoked_generations.popitem(last=False)
 
-    def _begin_stop(self, reason, disarm=False, fault=False, outcome="CANCELED"):
+    def _begin_stop(
+        self, reason, disarm=False, fault=False, outcome="CANCELED", serial_already_set=False
+    ):
         latched_state = self._state.state if self._state.state in ("FAULT", "ESTOP") else ""
         if latched_state:
             fault = True
@@ -1104,6 +1252,10 @@ class ControlRuntime(DeviceIOOwners):
                 self._stopping["disarm"] = True
             return
         self._permit = False
+        if not serial_already_set:
+            with self._stop_lock:
+                self._stop_serial += 1
+                self._handled_stop_serial = self._stop_serial
         self._output_generation += 1
         self._velocity_demand.put(None)
         # Preserve the queued segment until its exclusive I/O owner rejects it
@@ -1113,6 +1265,11 @@ class ControlRuntime(DeviceIOOwners):
         self._pulse_stop.set()
         self._reservation = None
         self._hold = self._jog = None
+        self._input_deadline = 0
+        self._jog_velocity.reset()
+        self._jog_rotation.reset(self.clock(), self._confirmed_pulses)
+        self._last_velocity = 0.0
+        self._last_output_ns = self.clock()
         self._stopping = dict(
             start=self.clock(),
             reason=reason,
@@ -1189,16 +1346,68 @@ class ControlRuntime(DeviceIOOwners):
                 self._begin_stop("JOG_EXPIRED")
                 return
             command = self._jog
+            dt = (now - self._jog_updated_ns) / 1e9
+            if dt <= 0:
+                return
             desired = command.linear_velocity_mm_s if command.axis_mask & 1 else 0.0
-            self._output_velocity(desired, now, estimate, None)
-            if command.axis_mask & 2:
-                angle = self._rotation_offset + self._quantizer.angle(self._confirmed_pulses)
-                target = clamp(
-                    angle + command.rotation_velocity_deg_s * self.config.pulse_segment_s,
-                    self.config.rotation_min_deg,
-                    self.config.rotation_max_deg,
+            if (
+                desired == 0
+                or desired * self._last_velocity < 0
+                or abs(desired) < abs(self._jog_last_desired)
+            ):
+                self._jog_feedback_retarget = True
+            self._jog_last_desired = desired
+            try:
+                self._jog_velocity.shape(desired, self.config.max_linear_mm_s2, dt)
+                self._jog_rotation.update(
+                    command.rotation_velocity_deg_s if command.axis_mask & 2 else 0.0,
+                    now,
+                    self._rotation_offset + self._quantizer.angle(self._confirmed_pulses),
                 )
-                self._plan_pulse(target, now, command.context.command_id)
+            except ValueError:
+                self._begin_stop("JOG_DT_INVALID", fault=True)
+                return
+            self._jog_updated_ns = now
+            if (
+                command.axis_mask & 1
+                and estimate.seq != self._jog_feedback_seq
+                and estimate.velocity_valid
+            ):
+                sample_dt = (estimate.received_ns - self._jog_feedback_ns) / 1e9
+                self._jog_feedback_ns, self._jog_feedback_seq = estimate.received_ns, estimate.seq
+                self._jog_feedback_retarget = False
+                requested = self._jog_velocity.request(
+                    estimate.velocity_mm_s, sample_dt, neutral=desired == 0
+                )
+                limited = self._output_velocity(requested, now, estimate, None)
+                self._jog_velocity.commit(
+                    self._output_seq,
+                    self._output_generation,
+                    requested,
+                    limited,
+                    sample_dt,
+                    neutral=desired == 0,
+                )
+                self._diagnostics.update(
+                    sample_dt_s=sample_dt,
+                    jog_raw_mm_s=requested,
+                    jog_filtered_velocity_mm_s=self._jog_velocity.filtered,
+                )
+            elif not command.axis_mask & 1:
+                self._output_velocity(0, now, estimate, None)
+            elif self._jog_feedback_retarget:
+                # A neutral/reverse/reduced intent may not prolong an old
+                # direction while waiting for the next valid measurement.
+                # Existing slew/braking limits apply; no PI integration or
+                # quantization receipt is replayed without a new sample.
+                if abs(self._jog_velocity.target - self._last_velocity) > 1e-12:
+                    self._output_velocity(self._jog_velocity.target, now, estimate, None)
+                else:
+                    self._refresh_jog_demand(now)
+            else:
+                self._refresh_jog_demand(now)
+            if command.axis_mask & 2:
+                self._plan_jog_pulse(now, command.context.command_id)
             return
         command = self._hold or self._motion
         if command is None:
@@ -1289,6 +1498,31 @@ class ControlRuntime(DeviceIOOwners):
         else:
             self._settled_since = None
 
+    def _refresh_jog_demand(self, now):
+        """Refresh permission metadata while the control writer is progressing.
+
+        Holding a still-valid measured sample is not new PI data. Preserve
+        velocity, output sequence, feedback time and STOP serial so the I/O
+        owner neither re-writes a setpoint nor settles quantization twice.
+        A frozen control writer cannot call this method; no source deadline
+        or receiver nonce deadline is restarted here.
+        """
+        demand = self._velocity_demand.get()
+        if (
+            demand is None
+            or demand.generation != self._output_generation
+            or demand.stop_serial != self.stop_serial
+            or not self._permit
+        ):
+            return
+        expiry = min(
+            now + round(self.config.output_ttl_s * 1e9),
+            self._jog_deadline,
+            self._input_deadline,
+            self._lease_deadline,
+        )
+        self._velocity_demand.put(replace(demand, expires_ns=expiry))
+
     def _output_velocity(self, requested, now, estimate, command):
         maximum = (
             command.limits.max_linear_mm_s
@@ -1318,9 +1552,16 @@ class ControlRuntime(DeviceIOOwners):
         self._diagnostics["output_dt_s"] = dt
         self._output_seq += 1
         expiry = min(self._lease_deadline, now + int(self.config.output_ttl_s * 1e9))
+        if self._jog:
+            expiry = min(expiry, self._input_deadline, self._jog_deadline)
         self._velocity_demand.put(
             _Demand(
-                limited, self._output_seq, self._output_generation, expiry, estimate.received_ns
+                limited,
+                self._output_seq,
+                self._output_generation,
+                expiry,
+                estimate.received_ns,
+                self.stop_serial,
             )
         )
         self._state = replace(self._state, requested_velocity_mm_s=limited)
@@ -1378,6 +1619,7 @@ class ControlRuntime(DeviceIOOwners):
             self._pulse_epoch,
             command_id,
             expires_ns=expiry,
+            stop_serial=self.stop_serial,
         )
         self._pending_segment = segment.segment_id
         self._pulse_segments[segment.segment_id] = segment
@@ -1386,6 +1628,7 @@ class ControlRuntime(DeviceIOOwners):
         self._pulse_demand.put((segment, expiry))
 
     def _handle_jog(self, command, now):
+        ingress_stop_serial = self.stop_serial
         if (
             not isinstance(command, JogCommand)
             or self._motion
@@ -1397,6 +1640,19 @@ class ControlRuntime(DeviceIOOwners):
             return OperationResult(False, "CONTROL_BUSY")
         context = command.context
         if (
+            not isinstance(context, CommandContext)
+            or not all(
+                isinstance(v, str) and 0 < len(v) <= 128
+                for v in (context.session_id, context.task_id, context.command_id)
+            )
+            or any(type(v) is not int or v < 0 for v in (context.generation, context.sequence))
+        ):
+            return OperationResult(False, "INVALID_CONTEXT")
+        if type(command.deadman) is not bool:
+            return OperationResult(False, "INVALID_JOG")
+        if context.sequence <= self._stop_fences.get((context.session_id, context.generation), -1):
+            return OperationResult(False, "STOP_FENCED")
+        if (
             not self._state.armed
             or not self._active_lifecycle
             or self._lease is None
@@ -1407,7 +1663,11 @@ class ControlRuntime(DeviceIOOwners):
         ):
             return OperationResult(False, "INVALID_PERMISSION")
         if not command.deadman:
-            self._begin_stop("DEADMAN_RELEASED")
+            self._latch_stop("DEADMAN_RELEASED", context=context)
+            self._begin_stop("DEADMAN_RELEASED", serial_already_set=True)
+            with self._stop_lock:
+                self._stop_request = None
+                self._handled_stop_serial = self._stop_serial
             return OperationResult(True)
         if type(command.admission_deadline_ns) is not int or command.admission_deadline_ns < 0:
             return OperationResult(False, "INVALID_TIMEOUT")
@@ -1438,16 +1698,76 @@ class ControlRuntime(DeviceIOOwners):
         key = (context.session_id, context.generation)
         if context.sequence <= self._highwater.get(key, -1):
             return OperationResult(False, "STALE_SEQUENCE")
-        self._highwater[key] = context.sequence
-        self._jog = command
-        self._jog_deadline = min(
-            now + int(command.ttl_s * 1e9),
+        try:
+            input_deadline = self._quality_tracker.validate(
+                command.quality, now, session_id=context.session_id, generation=context.generation
+            )
+        except ValueError as exc:
+            return OperationResult(False, getattr(exc, "code", "INVALID_MANUAL_QUALITY"), str(exc))
+        with self._stop_lock:
+            if ingress_stop_serial != self.stop_serial or self._stop_request is not None:
+                return OperationResult(False, "STOP_SUPERSEDED")
+            self._highwater[key] = context.sequence
+            if self._jog is None:
+                self._armed_stop_serial = self.stop_serial
+                self._output_generation += 1
+                self._jog_velocity.reset(self._estimator.state.velocity_mm_s)
+                self._jog_rotation.reset(now, self._confirmed_pulses)
+                self._last_velocity = 0.0
+                self._last_output_ns = now
+                self._jog_updated_ns = now
+                self._jog_feedback_ns = self._estimator.state.received_ns
+                self._jog_feedback_seq = self._estimator.state.seq
+                self._jog_last_desired = 0.0
+                self._jog_feedback_retarget = False
+            self._input_deadline = input_deadline
+            self._jog = command
+            self._jog_deadline = min(
+                now + int(command.ttl_s * 1e9),
+                self._lease_deadline,
+                command.admission_deadline_ns or self._lease_deadline,
+                input_deadline,
+            )
+            self._permit = True
+            self._state = replace(self._state, state="EXECUTING", command_id=context.command_id)
+            return OperationResult(True)
+
+    def _plan_jog_pulse(self, now, command_id):
+        if self._pending_segment is not None or not self._pulse_idle:
+            return
+        expiry = min(
             self._lease_deadline,
-            command.admission_deadline_ns or self._lease_deadline,
+            self._jog_deadline,
+            self._input_deadline,
+            now + round(self.config.output_ttl_s * 1e9),
         )
-        self._permit = True
-        self._state = replace(self._state, state="EXECUTING", command_id=context.command_id)
-        return OperationResult(True)
+        if now + round(self.config.pulse_segment_s * 1e9) > expiry:
+            return
+        profile = self._jog_rotation.plan(
+            now, self._confirmed_pulses, angle_offset=self._rotation_offset
+        )
+        if profile is None:
+            return
+        segment = PulseSegment(
+            str(uuid4()),
+            profile.signed_pulses,
+            profile.duration_s,
+            self._output_generation,
+            self._pulse_epoch,
+            command_id,
+            expiry,
+            profile.edge_offsets_us,
+            self.stop_serial,
+        )
+        self._pending_segment = segment.segment_id
+        self._pulse_segments[segment.segment_id] = segment
+        self._pulse_demand.put((segment, expiry))
+        self._diagnostics.update(
+            rotation_profile_start_deg_s=profile.start_rate_deg_s,
+            rotation_profile_end_deg_s=profile.end_rate_deg_s,
+            rotation_phase_start_pulses=profile.phase_start_pulses,
+            rotation_phase_end_pulses=profile.phase_end_pulses,
+        )
 
     def _inject(self, name, value):
         targets = {

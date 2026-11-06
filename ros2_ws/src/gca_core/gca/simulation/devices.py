@@ -1,10 +1,12 @@
 """Device-port simulations driven by a plant independent from motion targets."""
 
+from bisect import bisect_right
 from collections import deque
 from random import Random
 from time import monotonic_ns
 from uuid import uuid4
 
+from gca.algorithms.pulse_timing import validate_edge_offsets
 from gca.domain.models import (
     DeviceError,
     DeviceIdentity,
@@ -109,8 +111,9 @@ class SimEncoder:
 class SimPulseEngine:
     """One finite active segment; acceptance never increments confirmed count."""
 
-    def __init__(self, plant, clock=monotonic_ns):
+    def __init__(self, plant, clock=monotonic_ns, *, high_us=5, low_us=5, setup_us=10, hold_us=10):
         self.plant, self.clock, self.epoch = plant, clock, str(uuid4())
+        self.timing = dict(high_us=high_us, low_us=low_us, setup_us=setup_us, hold_us=hold_us)
         self._active = None
         self._started = self._emitted = 0
         self.unknown_abort = True
@@ -128,6 +131,10 @@ class SimPulseEngine:
             raise DeviceError("PULSE_BUSY_OR_EPOCH")
         if segment.duration_s <= 0 or not segment.signed_pulses:
             raise DeviceError("INVALID_PULSE_SEGMENT")
+        try:
+            validate_edge_offsets(segment, **self.timing)
+        except ValueError as exc:
+            raise DeviceError("PULSE_TIMING_INVALID", str(exc)) from exc
         if type(segment.expires_ns) is not int or segment.expires_ns < 0:
             raise DeviceError("INVALID_ARGUMENT")
         started_ns = self.clock()
@@ -140,7 +147,11 @@ class SimPulseEngine:
             return False
         elapsed = (self.clock() - self._started) / 1e9
         fraction = min(1.0, max(0.0, elapsed / self._active.duration_s))
-        pulses = int(abs(self._active.signed_pulses) * fraction)
+        pulses = (
+            bisect_right(self._active.edge_offsets_us, round(elapsed * 1e6))
+            if self._active.edge_offsets_us is not None
+            else int(abs(self._active.signed_pulses) * fraction)
+        )
         if self._active.signed_pulses < 0:
             pulses = -pulses
         self.plant.emit_pulses(pulses - self._emitted)
@@ -191,6 +202,13 @@ def simulated_devices(config, clock=monotonic_ns):
             config.simulation_encoder_delay_s,
             config.simulation_seed,
         ),
-        SimPulseEngine(plant, clock),
+        SimPulseEngine(
+            plant,
+            clock,
+            high_us=config.pulse_high_us,
+            low_us=config.pulse_low_us,
+            setup_us=config.direction_setup_us,
+            hold_us=config.direction_hold_us,
+        ),
         plant,
     )

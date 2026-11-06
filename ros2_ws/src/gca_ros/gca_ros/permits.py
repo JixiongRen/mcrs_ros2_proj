@@ -48,6 +48,8 @@ class MotionPermits:
     def __init__(self, capacity=256, maximum_s=1.0, clock=time.monotonic):
         self.capacity, self.maximum_s, self.clock = capacity, maximum_s, clock
         self._pending = OrderedDict()
+        self._fences = {}
+        self._seen = {}
         self._lock = RLock()
 
     @staticmethod
@@ -72,9 +74,14 @@ class MotionPermits:
 
     def _issue(self, capability, context, ttl_s, lease_deadline):
         self._expire()
+        self.check_fence(context)
         if not math.isfinite(ttl_s) or not 0 < ttl_s <= self.maximum_s:
             raise PermitError("INVALID_PERMIT_TTL")
         binding = self._binding(context)
+        key = binding[:2]
+        if key not in self._seen and len(self._seen) >= self.capacity:
+            raise PermitError("FENCE_CAPACITY")
+        self._seen[key] = max(binding[3], self._seen.get(key, 0))
         if (
             not binding[0]
             or not binding[2]
@@ -101,6 +108,7 @@ class MotionPermits:
             return self._consume(envelope, context)
 
     def _consume(self, envelope, context):
+        self.check_fence(context)
         capability_part(envelope)
         nonce = envelope.split(".", 1)[1]
         permit = self._pending.pop(nonce, None)
@@ -111,3 +119,50 @@ class MotionPermits:
         if permit.context != self._binding(context):
             raise PermitError("MOTION_PERMIT_CONTEXT_MISMATCH")
         return permit.deadline
+
+    def check_fence(self, context):
+        """Caller must authenticate first; fence does not confer authority."""
+        with self._lock:
+            key = (context.session_id, int(context.generation))
+            if int(context.sequence) <= self._fences.get(key, 0):
+                raise PermitError("STOP_FENCED")
+
+    def fence(self, context):
+        with self._lock:
+            key = (context.session_id, int(context.generation))
+            sequence = int(context.sequence)
+            if not key[0] or key[1] < 1 or sequence < 1:
+                raise PermitError("INVALID_CONTEXT")
+            if key not in self._fences and len(self._fences) >= self.capacity:
+                raise PermitError("FENCE_CAPACITY")
+            self._fences[key] = max(sequence, self._fences.get(key, 0))
+            self._seen[key] = max(sequence, self._seen.get(key, 0))
+            for nonce, permit in list(self._pending.items()):
+                binding = permit.context
+                if binding[:2] == key and binding[3] <= self._fences[key]:
+                    del self._pending[nonce]
+            return self._fences[key]
+
+    def retire_session(self, session_id):
+        """Only after session auth has been revoked, reclaim its bounded history."""
+        with self._lock:
+            for mapping in (self._fences, self._seen):
+                for key in list(mapping):
+                    if key[0] == session_id:
+                        del mapping[key]
+            for nonce, permit in list(self._pending.items()):
+                if permit.context[0] == session_id:
+                    del self._pending[nonce]
+
+    def highwater(self, session_id, generation):
+        with self._lock:
+            return self._seen.get((session_id, generation), 0)
+
+    def retire_generation(self, session_id, generation):
+        """After its authority/STOP alias is revoked, reclaim one old generation."""
+        with self._lock:
+            self._fences.pop((session_id, generation), None)
+            self._seen.pop((session_id, generation), None)
+            for nonce, permit in list(self._pending.items()):
+                if permit.context[:2] == (session_id, generation):
+                    del self._pending[nonce]

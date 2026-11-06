@@ -5,3 +5,4 @@ bool deadman
 float64 linear_velocity_m_s
 float64 rotation_velocity_rad_s
 float64 ttl_s
+gca_system_interfaces/ManualInputQuality quality

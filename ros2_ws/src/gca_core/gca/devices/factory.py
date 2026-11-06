@@ -90,6 +90,13 @@ def hardware_devices(config, clock=time.monotonic_ns):
     )
     if not pulse.exclusive_wave_owner or not pulse.waveform_hil_verified:
         raise DeviceError("HARDWARE_UNVERIFIED", "finite-wave timing/counting evidence required")
+    if (
+        config.pulse_high_us != pulse.high_us
+        or config.pulse_low_us != pulse.low_us
+        or config.direction_setup_us != pulse.direction_setup_us
+        or config.direction_hold_us != pulse.direction_hold_us
+    ):
+        raise DeviceError("CONFIG_INVALID", "runtime/profile and physical pulse timing must match")
     configured_modulus = encoder.modulus or 0
     if config.encoder_count_modulus != configured_modulus:
         raise DeviceError("CONFIG_INVALID", "encoder protocol and runtime count modulus must match")

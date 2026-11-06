@@ -1,7 +1,7 @@
 # Model values only. They are not measured hardware limits or calibrated gains.
 runtime:
   backend: simulation
-  revision: simulation-v1
+  revision: simulation-teleop-v2
   control_period_s: 0.01
   encoder_period_s: 0.02
   io_period_s: 0.005
@@ -24,12 +24,24 @@ runtime:
   kd: 0.0
   kaw: 2.0
   integral_limit_mm_s: 5.0
+  jog_velocity_kp: 0.25
+  jog_velocity_ki: 4.0
+  jog_velocity_kaw: 2.0
+  jog_integral_limit_mm_s: 10.0
+  jog_velocity_filter_s: 0.04
+  jog_dt_max_s: 0.20
+  manual_input_max_age_s: 0.15
+  jog_phase_gain_s: 8.0
   position_tolerance_mm: 0.08
   velocity_tolerance_mm_s: 0.15
   settle_s: 0.15
   pulses_per_motor_rev: 6400
   catheter_per_motor_ratio: 0.5666666666666667
   pulse_segment_s: 0.03
+  pulse_high_us: 5
+  pulse_low_us: 5
+  direction_setup_us: 10
+  direction_hold_us: 10
   simulation_seed: 7
   simulation_noise_mm: 0.0
   simulation_encoder_delay_s: 0.0

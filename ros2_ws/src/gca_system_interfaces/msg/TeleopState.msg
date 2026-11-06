@@ -1,0 +1,26 @@
+builtin_interfaces/Time stamp
+string run_id
+string input_epoch
+string gate_state
+string gate_reason
+bool deadman
+bool b_pressed
+bool session_owned
+bool armed
+string source_mode
+gca_system_interfaces/ManualInputQuality quality
+float64 requested_linear_m_s
+float64 requested_rotation_rad_s
+float64 applied_linear_m_s
+# Estimated from accepted pulse timing, never measured shaft feedback.
+float64 estimated_rotation_rad_s
+bool estimated_rotation_velocity_valid
+string device_state
+gca_system_interfaces/StopStatus stop
+bool linear_valid
+bool rotation_valid
+string reference_id
+string config_revision
+uint32 pending_count
+uint32 inflight_count
+uint64 dropped_count

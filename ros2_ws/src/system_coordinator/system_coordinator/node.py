@@ -11,6 +11,8 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 
 import rclpy
+from gca.domain.manual import QualityTracker
+from gca_ros.conversion import quality_from_ros
 from gca_ros.permits import MotionPermits, capability_part, same_motion_payload
 from gca_system_interfaces.action import ExecuteMotion
 from gca_system_interfaces.msg import CommandContext, GcaState, JogCommand
@@ -56,6 +58,7 @@ class SystemCoordinator(Node):
         self.declare_parameter("source_lease_max_s", 5.0)
         self.declare_parameter("executor_lease_s", 2.0)
         self.declare_parameter("rpc_timeout_s", 2.0)
+        self.declare_parameter("handover_timeout_s", 2.0)
         self.declare_parameter("profile", "gca_only")
         if self.get_parameter("profile").value != "gca_only":
             raise ValueError(
@@ -66,8 +69,12 @@ class SystemCoordinator(Node):
         self._rpc_waits = {}
         self._rpc_requests = {}
         self._background_futures = set()
+        self._background_clients = {}
         self._background_errors = deque(maxlen=16)
-        self._authority = SourceAuthority(float(self.get_parameter("source_lease_max_s").value))
+        self._authority = SourceAuthority(
+            float(self.get_parameter("source_lease_max_s").value),
+            handover_s=self.get_parameter("handover_timeout_s").value,
+        )
         self._executor_lease_s = float(self.get_parameter("executor_lease_s").value)
         self._rpc_timeout = bounded_positive_seconds(
             self.get_parameter("rpc_timeout_s").value, "rpc_timeout_s"
@@ -79,6 +86,8 @@ class SystemCoordinator(Node):
             raise ValueError("executor_lease_s must be finite between 0.1 and 5")
         self.action_group = MutuallyExclusiveCallbackGroup()
         self.management_group = MutuallyExclusiveCallbackGroup()
+        self.stop_group = MutuallyExclusiveCallbackGroup()
+        self.fault_group = MutuallyExclusiveCallbackGroup()
         self.clients_group = ReentrantCallbackGroup()
         self.telemetry_group = MutuallyExclusiveCallbackGroup()
         self._tasks = OrderedDict()
@@ -86,10 +95,12 @@ class SystemCoordinator(Node):
         self._denials = OrderedDict()
         self._highwater = {}
         self._motion_permits = MotionPermits()
+        self._quality = QualityTracker()
+        self._stop_epoch = 0
         self._pending_jog = None
         self._jog_forwarding = False
         self._jog_epoch = 0
-        self._jog_stopping = False
+        self._jog_stopping = None
         self._state = GcaState()
         self._state.state = "INITIALIZING"
         self._retired_boots = deque(maxlen=64)
@@ -115,6 +126,18 @@ class SystemCoordinator(Node):
             )
             for name in ("arm", "disarm", "reset_fault", "request_stop", "set_reference")
         }
+        self._priority_stop_clients = {
+            name: self.create_client(
+                ManageDevice, "/gca/coordinator_" + name, callback_group=self.clients_group
+            )
+            for name in ("stop", "disarm")
+        }
+        self.create_service(
+            ControlSession,
+            "/system/acknowledge_generation",
+            self._acknowledge,
+            callback_group=self.stop_group,
+        )
         self._config_client = self.create_client(
             ApplyConfig, "/gca/apply_config", callback_group=self.clients_group
         )
@@ -136,13 +159,15 @@ class SystemCoordinator(Node):
                 ManageDevice,
                 "/system/" + operation,
                 functools.partial(self._manage, operation),
-                callback_group=self.management_group,
+                callback_group=self.stop_group
+                if operation in ("request_stop", "disarm")
+                else self.management_group,
             )
         self.create_service(
             ApplyConfig, "/system/apply_config", self._config, callback_group=self.management_group
         )
         self.create_service(
-            InjectFault, "/system/inject_fault", self._fault, callback_group=self.management_group
+            InjectFault, "/system/inject_fault", self._fault, callback_group=self.fault_group
         )
         self.create_service(
             GetCommandStatus,
@@ -246,9 +271,11 @@ class SystemCoordinator(Node):
             with self._lock:
                 self._rpc_requests.pop(original, None)
 
-    def _track_background(self, future):
+    def _track_background(self, future, client=None):
         with self._lock:
             self._background_futures.add(future)
+            if client is not None:
+                self._background_clients[future] = client
 
         def completed(source):
             try:
@@ -257,6 +284,7 @@ class SystemCoordinator(Node):
                 self._background_errors.append(type(exc).__name__)
             with self._lock:
                 self._background_futures.discard(source)
+                self._background_clients.pop(source, None)
 
         future.add_done_callback(completed)
         return future
@@ -273,6 +301,62 @@ class SystemCoordinator(Node):
                 )
             except SessionError:
                 return self._authority.verify_retired(context.session_id, context.generation, token)
+
+    def _stop_verify(self, context, token):
+        with self._lock:
+            return self._authority.verify_stop(context.session_id, context.generation, token)
+
+    def _acknowledge(self, request, response):
+        try:
+            with self._lock:
+                source = self._authority.verify(
+                    request.context.session_id, request.context.generation, request.token
+                )
+                previous = source.stop_alias_generation
+                source = self._authority.acknowledge(
+                    request.context.session_id, request.context.generation, request.token
+                )
+                if previous:
+                    self._motion_permits.retire_generation(source.session_id, previous)
+                    self._quality.clear_session(source.session_id, previous)
+            response.accepted, response.error_code = True, "OK"
+            response.context = self._domain_context(source)
+            response.granted_lease_s = max(0.0, source.deadline - time.monotonic())
+        except SessionError as exc:
+            response.error_code = str(exc)
+        return response
+
+    def _fence_stop(self, context, source):
+        # No awaits and no regular-management lock is held across remote calls.
+        with self._lock:
+            # Authentication may have completed before another callback released
+            # that owner or acknowledged its generation. Revalidate while holding
+            # the same lock that commits the shared STOP epochs and mailbox.
+            source = self._authority.verify_stop(
+                context.session_id, context.generation, source.token
+            )
+            self._stop_epoch += 1
+            self._jog_epoch += 1
+            self._pending_jog = None
+            for generation in {context.generation, source.generation}:
+                bound = copy.deepcopy(context)
+                bound.generation = generation
+                self._motion_permits.fence(bound)
+
+    def _check_arm(self, source, epoch):
+        with self._lock:
+            if (
+                self._authority.current is not source
+                or self._stop_epoch != epoch
+                or time.monotonic() >= source.deadline
+                or self._closing
+            ):
+                raise SessionError("ARM_INTERRUPTED_BY_STOP")
+
+    def _priority_stop_request(self, source, context):
+        forwarded = ManageDevice.Request(context=copy.deepcopy(context), token=self._key)
+        forwarded.context.generation = source.generation
+        return forwarded
 
     def _domain_context(self, source, command_id=""):
         return CommandContext(
@@ -369,6 +453,7 @@ class SystemCoordinator(Node):
                 source.deadline = time.monotonic() + duration
             else:
                 source = self._restricted_verify(request.context, request.token)
+                self._fence_stop(request.context, source)
                 grant = await self._call(
                     self._lease_client, self._lease_request(source, 0.0, release=True)
                 )
@@ -377,6 +462,8 @@ class SystemCoordinator(Node):
                 with self._lock:
                     self._authority.release()
                     self._highwater.pop(source.session_id, None)
+                    self._quality.clear_session(source.session_id)
+                    self._motion_permits.retire_session(source.session_id)
             response.accepted = True
             response.error_code = "OK"
             response.context = self._domain_context(source)
@@ -392,32 +479,58 @@ class SystemCoordinator(Node):
         return response
 
     async def _manage(self, operation, request, response):
+        source = None
+        with self._lock:
+            arm_epoch = self._stop_epoch
         try:
-            if operation in ("request_stop", "disarm"):
-                source = self._restricted_verify(request.context, request.token)
+            stopping = operation in ("request_stop", "disarm")
+            source = (
+                self._stop_verify(request.context, request.token)
+                if stopping
+                else self._verify(request.context, request.token)
+            )
+            if stopping:
+                self._fence_stop(request.context, source)
+                disarm = operation == "disarm" or bool(source.handover_deadline)
+                if disarm:
+                    source.needs_reauthorization = True
+                device = await self._call(
+                    self._priority_stop_clients["disarm" if disarm else "stop"],
+                    self._priority_stop_request(source, request.context),
+                )
             else:
-                source = self._verify(request.context, request.token)
-            if operation == "arm" and source.needs_reauthorization:
-                if self._state.state != "DISARMED" or self._state.stop.progress != "CONFIRMED":
-                    raise SessionError("WAIT_FOR_DISARMED")
-                released = await self._call(
-                    self._lease_client, self._lease_request(source, 0.0, release=True)
-                )
-                if not released.accepted:
-                    raise SessionError(released.error_code)
-                with self._lock:
-                    self._authority.rotate_generation(source)
-                duration = min(self._executor_lease_s, source.deadline - time.monotonic())
-                granted = await self._call(
-                    self._lease_client, self._lease_request(source, duration)
-                )
-                if not granted.accepted:
-                    raise SessionError(granted.error_code)
-                source.executor_token = granted.token
-            forwarded = copy.deepcopy(request)
-            forwarded.context.generation = source.generation
-            forwarded.token = source.executor_token
-            device = await self._call(self._manage_clients[operation], forwarded)
+                if operation == "arm":
+                    if source.handover_deadline:
+                        raise SessionError("HANDOVER_ACK_REQUIRED")
+                    self._motion_permits.check_fence(request.context)
+                    self._check_arm(source, arm_epoch)
+                if operation == "arm" and source.needs_reauthorization:
+                    if self._state.state != "DISARMED" or self._state.stop.progress != "CONFIRMED":
+                        raise SessionError("WAIT_FOR_DISARMED")
+                    released = await self._call(
+                        self._lease_client, self._lease_request(source, 0.0, release=True)
+                    )
+                    self._check_arm(source, arm_epoch)
+                    if not released.accepted:
+                        raise SessionError(released.error_code)
+                    with self._lock:
+                        self._authority.rotate_generation(source)
+                    duration = min(self._executor_lease_s, source.deadline - time.monotonic())
+                    granted = await self._call(
+                        self._lease_client, self._lease_request(source, duration)
+                    )
+                    self._check_arm(source, arm_epoch)
+                    if not granted.accepted:
+                        raise SessionError(granted.error_code)
+                    source.executor_token = granted.token
+                forwarded = copy.deepcopy(request)
+                forwarded.context.generation = source.generation
+                forwarded.token = source.executor_token
+                if operation == "arm":
+                    self._check_arm(source, arm_epoch)
+                device = await self._call(self._manage_clients[operation], forwarded)
+                if operation == "arm":
+                    self._check_arm(source, arm_epoch)
             response.accepted, response.error_code, response.message = (
                 device.accepted,
                 device.error_code,
@@ -427,11 +540,15 @@ class SystemCoordinator(Node):
             response.state.generation = source.generation
             if device.accepted and operation in ("disarm", "reset_fault"):
                 source.needs_reauthorization = True
-            elif device.accepted and operation == "arm":
-                source.needs_reauthorization = False
-        except (SessionError, TimeoutError) as exc:
+            elif operation == "arm":
+                source.needs_reauthorization = not device.accepted
+        except (SessionError, ValueError, TimeoutError) as exc:
             response.error_code = str(exc)
-            response.state = self._state
+            response.state = copy.deepcopy(self._state)
+            if source is not None:
+                response.state.generation = source.generation
+                if operation == "arm":
+                    source.needs_reauthorization = True
         return response
 
     async def _config(self, request, response):
@@ -724,19 +841,34 @@ class SystemCoordinator(Node):
         try:
             if not request.deadman:
                 base = capability_part(request.token) if "." in request.token else request.token
-                source = self._verify(request.context, base, expired=True)
+                source = self._stop_verify(request.context, base)
                 with self._lock:
-                    self._pending_jog = None
-                    self._jog_epoch += 1
-                    if not self._jog_stopping:
-                        self._jog_stopping = True
-                        self.executor.create_task(self._stop_jog, copy.deepcopy(request), source)
+                    self._fence_stop(request.context, source)
+                    identity = (source.session_id, source.generation)
+                    if self._jog_stopping is None or self._jog_stopping[:2] != identity:
+                        # An old owner's/generation's RPC cannot suppress the
+                        # current STOP or clear its worker on exit. Capture the
+                        # generation now; SourceSession is mutable during ARM.
+                        work = (*identity, object())
+                        self._jog_stopping = work
+                        self.executor.create_task(
+                            self._stop_jog, copy.deepcopy(request), source, work
+                        )
                 return
             source = self._verify(request.context, capability_part(request.token))
             if source.mode != "MANUAL":
                 raise SessionError("MANUAL_MODE_REQUIRED")
             deadline = self._motion_permits.consume(request.token, request.context)
+            input_deadline = self._quality.validate(
+                quality_from_ros(request.quality),
+                time.monotonic_ns(),
+                session_id=request.context.session_id,
+                generation=request.context.generation,
+            )
+            deadline = min(deadline, input_deadline / 1e9)
             with self._lock:
+                source = self._verify(request.context, capability_part(request.token))
+                self._motion_permits.check_fence(request.context)
                 self._pending_jog = (copy.deepcopy(request), source, deadline, self._jog_epoch)
                 if not self._jog_forwarding:
                     self._jog_forwarding = True
@@ -756,6 +888,7 @@ class SystemCoordinator(Node):
                 try:
                     permit = await self._device_motion_permit(source, request.context, deadline)
                     self._verify(request.context, capability_part(request.token))
+                    self._motion_permits.check_fence(request.context)
                     with self._lock:
                         if epoch != self._jog_epoch:
                             continue
@@ -779,17 +912,18 @@ class SystemCoordinator(Node):
                 self._jog_forwarding = True
                 self.executor.create_task(self._forward_jog)
 
-    async def _stop_jog(self, request, source):
+    async def _stop_jog(self, request, source, work):
         try:
-            stop = ManageDevice.Request(context=request.context, token=source.executor_token)
-            await self._call(self._manage_clients["request_stop"], stop)
+            stop = self._priority_stop_request(source, request.context)
+            await self._call(self._priority_stop_clients["stop"], stop)
         except (SessionError, TimeoutError) as exc:
             # Failure cannot renew an old velocity: both Jog and executor leases
             # remain finite at the device, even when the stop RPC is unavailable.
             self._background_errors.append("JOG_STOP_RPC: " + str(exc))
         finally:
             with self._lock:
-                self._jog_stopping = False
+                if self._jog_stopping is work:
+                    self._jog_stopping = None
 
     def _receive_state(self, state):
         if self._closing:
@@ -843,19 +977,39 @@ class SystemCoordinator(Node):
         source = self._authority.current
         if source is None:
             return
+        context = self._domain_context(source)
+        context.sequence = (
+            max(
+                source.renewal_sequence,
+                self._motion_permits.highwater(source.session_id, source.generation),
+            )
+            + 1
+        )
+        self._fence_stop(context, source)
+        self._track_background(
+            self._priority_stop_clients["disarm"].call_async(
+                self._priority_stop_request(source, context)
+            ),
+            self._priority_stop_clients["disarm"],
+        )
         if self._lease_client.service_is_ready():
             self._track_background(
                 self._lease_client.call_async(self._lease_request(source, 0.0, release=True))
             )
         self._authority.release()
         self._highwater.pop(source.session_id, None)
+        self._quality.clear_session(source.session_id)
+        self._motion_permits.retire_session(source.session_id)
 
     def _watchdog(self):
         if self._closing:
             return
         with self._lock:
             source = self._authority.current
-            if source is not None and time.monotonic() >= source.deadline:
+            if source is not None and (
+                time.monotonic() >= source.deadline
+                or (source.handover_deadline and time.monotonic() >= source.handover_deadline)
+            ):
                 self._expire_source("SOURCE_EXPIRED")
         for record in list(self._tasks.values()):
             if record.handle is None and not record.committed:
@@ -891,7 +1045,7 @@ class SystemCoordinator(Node):
             self._rpc_waits.clear()
             requests = list(self._rpc_requests.items())
             self._rpc_requests.clear()
-            background = list(self._background_futures)
+            background = [(f, self._background_clients.get(f)) for f in self._background_futures]
         for future, client in requests:
             client.remove_pending_request(future)
         for wrapped, (original, timer) in waits:
@@ -901,9 +1055,10 @@ class SystemCoordinator(Node):
                 wrapped.set_exception(SessionError("SHUTTING_DOWN"))
             if not original.done():
                 original.cancel()
-        for future in background:
+        for future, client in background:
             if not future.done():
-                self._lease_client.remove_pending_request(future)
+                if client is not None:
+                    client.remove_pending_request(future)
                 future.cancel()
 
 

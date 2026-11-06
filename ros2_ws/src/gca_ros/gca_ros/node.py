@@ -8,6 +8,7 @@ from racing a terminal canceled() call.
 
 import copy
 import functools
+import json
 import math
 import os
 import signal
@@ -22,6 +23,7 @@ import rclpy
 import yaml
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from gca.config import RuntimeConfig
+from gca.domain.manual import QualityTracker
 from gca.domain.models import Lease, MotionEvent, OperationResult, RuntimeState
 from gca.runtime import ControlRuntime
 from gca_system_interfaces.action import ExecuteMotion
@@ -43,8 +45,15 @@ from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
+from std_msgs.msg import String
 
-from .conversion import jog_from_ros, motion_from_ros, state_from_core
+from .conversion import (
+    context_from_ros,
+    jog_from_ros,
+    motion_from_ros,
+    quality_from_ros,
+    state_from_core,
+)
 from .permits import MotionPermits, capability_part, same_motion_payload
 from .security import AccessError, LeaseAuthority
 
@@ -69,6 +78,8 @@ class GcaControlNode(LifecycleNode):
         super().__init__("gca_control_node")
         self.management_group = self.default_callback_group
         self.action_group = MutuallyExclusiveCallbackGroup()
+        self.stop_group = MutuallyExclusiveCallbackGroup()
+        self.fault_group = MutuallyExclusiveCallbackGroup()
         self.telemetry_group = MutuallyExclusiveCallbackGroup()
         self._lock = threading.RLock()
         self.runtime = None
@@ -84,6 +95,9 @@ class GcaControlNode(LifecycleNode):
         self._pending_terminal_events = deque()
         self._telemetry_release = threading.Event()
         self._telemetry_release.set()
+        self._arm_release = threading.Event()
+        self._arm_release.set()
+        self._arm_waiting = False
         self._config_names = {f.name for f in fields(RuntimeConfig) if f.name != "hardware"}
         defaults = RuntimeConfig().as_dict()
         for name, value in defaults.items():
@@ -105,6 +119,11 @@ class GcaControlNode(LifecycleNode):
             self.get_parameter("coordinator_key").value, self._config.lease_max_s
         )
         self._motion_permits = MotionPermits(capacity=self._config.history_capacity)
+        self._quality = QualityTracker(
+            backend=self._config.backend,
+            max_age_s=self._config.manual_input_max_age_s,
+            capacity=self._config.history_capacity,
+        )
         self._guard = self.create_guard_condition(self._drain, callback_group=self.action_group)
         self._config_guard = self.create_guard_condition(
             self._apply_pending_config, callback_group=self.management_group
@@ -137,7 +156,16 @@ class GcaControlNode(LifecycleNode):
                 ManageDevice,
                 "/gca/" + operation,
                 functools.partial(self._manage, operation),
-                callback_group=self.management_group,
+                callback_group=self.stop_group
+                if operation in ("request_stop", "disarm")
+                else self.management_group,
+            )
+        for name in ("stop", "disarm"):
+            self.create_service(
+                ManageDevice,
+                "/gca/coordinator_" + name,
+                functools.partial(self._coordinator_stop, disarm=name == "disarm"),
+                callback_group=self.stop_group,
             )
         self.create_service(
             GetCapabilities,
@@ -158,7 +186,7 @@ class GcaControlNode(LifecycleNode):
             callback_group=self.management_group,
         )
         self.create_service(
-            InjectFault, "/gca/inject_fault", self._fault, callback_group=self.management_group
+            InjectFault, "/gca/inject_fault", self._fault, callback_group=self.fault_group
         )
         qos = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE
@@ -173,6 +201,7 @@ class GcaControlNode(LifecycleNode):
         )
         # Ordinary publishers intentionally remain available while inactive/faulted.
         self._state_pub = self.create_publisher(GcaState, "/gca/state", state_qos)
+        self._arm_phase_pub = self.create_publisher(String, "/gca/arm_phase", state_qos)
         self._diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 5)
         hz = float(self.get_parameter("telemetry_hz").value)
         if not math.isfinite(hz) or not 0.5 <= hz <= 100:
@@ -219,6 +248,11 @@ class GcaControlNode(LifecycleNode):
             if self.runtime is not None:
                 return TransitionCallbackReturn.FAILURE
             self._config = self._read_config()
+            self._quality = QualityTracker(
+                backend=self._config.backend,
+                max_age_s=self._config.manual_input_max_age_s,
+                capacity=self._config.history_capacity,
+            )
             self._requested_revision = self._config.revision
             devices = None
             if self._config.backend == "hardware":
@@ -296,6 +330,9 @@ class GcaControlNode(LifecycleNode):
 
     def _shutdown_runtime(self):
         self._active = False
+        if self.runtime is not None:
+            self.runtime.stop("LIFECYCLE_SHUTDOWN", disarm=True)
+        self._arm_release.set()
         self._terminal_paused = False
         self._telemetry_release.set()
         if self.runtime is None:
@@ -308,8 +345,15 @@ class GcaControlNode(LifecycleNode):
         if not closed.accepted:
             return TransitionCallbackReturn.ERROR
         self.runtime = None
-        self._authority.revoke()
+        self._revoke_authority()
         return TransitionCallbackReturn.SUCCESS
+
+    def _revoke_authority(self):
+        grant = self._authority.grant
+        self._authority.revoke()
+        if grant is not None:
+            self._quality.clear_session(grant.session_id, grant.generation)
+            self._motion_permits.retire_generation(grant.session_id, grant.generation)
 
     def _authorized(self, context, token, expired=False):
         return self._authority.verify(
@@ -349,14 +393,14 @@ class GcaControlNode(LifecycleNode):
                 snapshot = self._snapshot()
                 if snapshot.armed or snapshot.stop_progress != "CONFIRMED":
                     self.runtime.stop("CONTROL_RELEASED", disarm=True)
-                self._authority.revoke()
+                self._revoke_authority()
                 response.accepted = True
                 response.error_code = "OK"
                 return response
             old = self._authority.grant
             if old is not None and time.monotonic() >= old.deadline:
                 if self._snapshot().state in ("DISARMED", "FAULT", "READY"):
-                    self._authority.revoke()
+                    self._revoke_authority()
             if self._authority.grant is None and self._snapshot().armed:
                 raise AccessError("EXECUTOR_STOPPING_OR_FAULTED")
             grant = self._authority.issue(
@@ -378,7 +422,7 @@ class GcaControlNode(LifecycleNode):
                     )
                 )
                 if not result.accepted:
-                    self._authority.revoke()
+                    self._revoke_authority()
                     raise AccessError(result.code)
             response.accepted = True
             response.error_code = "OK"
@@ -390,14 +434,45 @@ class GcaControlNode(LifecycleNode):
         return response
 
     def _manage(self, operation, request, response):
+        expected_serial = self.runtime.stop_serial if self.runtime is not None else 0
         try:
             if operation in ("request_stop", "disarm"):
-                grant = self._restricted_authorized(request.context, request.token)
-            else:
-                grant = self._authorized(request.context, request.token)
+                with self._authority.transaction_lock:
+                    self._restricted_authorized(request.context, request.token)
+                    if self.runtime is None:
+                        raise AccessError("NOT_CONFIGURED")
+                    result = self._stop_runtime(
+                        operation.upper(), request.context, operation == "disarm"
+                    )
+                response.accepted, response.error_code, response.message = (
+                    result.accepted,
+                    result.code,
+                    result.message,
+                )
+                response.state = self._state_msg()
+                return response
+            grant = self._authorized(request.context, request.token)
             if self.runtime is None:
                 raise AccessError("NOT_CONFIGURED")
             if operation == "arm":
+                if not self._arm_release.is_set():
+                    self._arm_waiting = True
+                    self._publish_arm_phase("WAITING", request.context)
+                    try:
+                        released = self._arm_release.wait(timeout=1.0)
+                    finally:
+                        self._arm_waiting = False
+                    if not released:
+                        self._publish_arm_phase("TIMEOUT", request.context)
+                        self._motion_permits.fence(request.context)
+                        self.runtime.stop(
+                            "ARM_PAUSE_TIMEOUT",
+                            disarm=True,
+                            context=context_from_ros(request.context),
+                        )
+                        raise AccessError("ARM_PAUSE_TIMEOUT")
+                    self._publish_arm_phase("RELEASED", request.context)
+                self._motion_permits.check_fence(request.context)
                 if not self._active or self._config_pending:
                     raise AccessError("NOT_ACTIVE_OR_CONFIG_PENDING")
                 if self._requested_revision != self._snapshot().config_revision:
@@ -409,7 +484,8 @@ class GcaControlNode(LifecycleNode):
                         grant.sequence,
                         max(0.0, grant.deadline - time.monotonic()),
                         grant.token,
-                    )
+                    ),
+                    expected_stop_serial=expected_serial,
                 )
             elif operation == "set_reference":
                 result = self.runtime.set_reference(
@@ -418,7 +494,13 @@ class GcaControlNode(LifecycleNode):
             elif operation == "reset_fault":
                 result = self.runtime.reset()
             else:
-                result = self.runtime.stop(operation.upper(), disarm=operation == "disarm")
+                self._motion_permits.fence(request.context)
+                result = self.runtime.stop(
+                    operation.upper(),
+                    disarm=operation == "disarm",
+                    context=context_from_ros(request.context),
+                )
+                self._arm_release.set()
             response.accepted = result.accepted
             response.error_code = result.code
             response.message = result.message
@@ -426,6 +508,58 @@ class GcaControlNode(LifecycleNode):
         except (AccessError, ValueError) as exc:
             response.error_code = str(exc)
             response.message = "Management request rejected"
+        response.state = self._state_msg()
+        return response
+
+    def _publish_arm_phase(self, phase, context):
+        self._arm_phase_pub.publish(
+            String(
+                data=json.dumps(
+                    {
+                        "phase": phase,
+                        "boot_id": self._snapshot().boot_id,
+                        "command_id": context.command_id,
+                        "stop_serial": getattr(self.runtime, "stop_serial", 0),
+                    }
+                )
+            )
+        )
+
+    def _stop_runtime(self, reason, context, disarm=False):
+        self._motion_permits.fence(context)
+        # The adapter has authenticated the source. During handover the core
+        # still has its old Lease while the ROS authority knows the new one.
+        # Always latch the serial first: a future-gen contextual stop alone
+        # would fail core lease matching and miss a queued ARM.
+        runtime = self.runtime
+        if runtime is None:
+            return OperationResult(False, "NOT_CONFIGURED")
+        result = runtime.stop(reason, disarm=disarm)
+        current = runtime.snapshot()
+        if current.session_id == context.session_id and current.generation:
+            bound = copy.deepcopy(context)
+            bound.generation = current.generation
+            self._motion_permits.fence(bound)
+            runtime.stop(reason, disarm=disarm, context=context_from_ros(bound))
+        self._arm_release.set()
+        return result
+
+    def _coordinator_stop(self, request, response, disarm=False):
+        try:
+            with self._authority.transaction_lock:
+                known = self._authority.coordinator_stop(request.token, request.context.session_id)
+                if self.runtime is None:
+                    raise AccessError("NOT_CONFIGURED")
+                # Fence both receiver-authorized and source handover generations.
+                for generation in {known.generation, request.context.generation}:
+                    context = copy.deepcopy(request.context)
+                    context.generation = generation
+                    self._motion_permits.fence(context)
+                result = self._stop_runtime("COORDINATOR_STOP", request.context, disarm)
+            response.accepted, response.error_code = result.accepted, result.code
+            response.message = result.message
+        except (AccessError, ValueError) as exc:
+            response.error_code = str(exc)
         response.state = self._state_msg()
         return response
 
@@ -558,12 +692,20 @@ class GcaControlNode(LifecycleNode):
         try:
             if not request.deadman:
                 base = capability_part(request.token) if "." in request.token else request.token
-                self._authorized(request.context, base, expired=True)
-                if self.runtime is not None:
-                    self.runtime.stop("DEADMAN_RELEASED")
+                with self._authority.transaction_lock:
+                    self._restricted_authorized(request.context, base)
+                    if self.runtime is not None:
+                        self._stop_runtime("DEADMAN_RELEASED", request.context)
                 return
             grant = self._authorized(request.context, capability_part(request.token))
             deadline = self._motion_permits.consume(request.token, request.context)
+            input_deadline = self._quality.validate(
+                quality_from_ros(request.quality),
+                time.monotonic_ns(),
+                session_id=request.context.session_id,
+                generation=request.context.generation,
+            )
+            deadline = min(deadline, input_deadline / 1e9)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AccessError("MOTION_PERMIT_EXPIRED")
@@ -730,7 +872,13 @@ class GcaControlNode(LifecycleNode):
                 self._authorized(request.context, request.token)
             else:
                 self._restricted_authorized(request.context, request.token)
-            if request.name == "terminal_pause":
+            if request.name == "arm_pause":
+                if request.enabled:
+                    self._arm_release.clear()
+                else:
+                    self._arm_release.set()
+                result = OperationResult(True)
+            elif request.name == "terminal_pause":
                 self._terminal_paused = request.enabled
                 if not request.enabled:
                     self._guard.trigger()
@@ -778,8 +926,16 @@ class GcaControlNode(LifecycleNode):
         status.values = [
             KeyValue(key="sample_age_s", value=str(state.feedback_age_s)),
             KeyValue(key="stop_progress", value=state.stop.progress),
+            KeyValue(key="arm_waiting", value=str(self._arm_waiting)),
             KeyValue(key="config_last_error", value=self._config_application_error),
         ]
+        if self._config.backend == "simulation" and self.runtime is not None:
+            status.values.append(
+                KeyValue(
+                    key="simulation_io_evidence",
+                    value=json.dumps(self.runtime.simulation_evidence(), allow_nan=False),
+                )
+            )
         recorder = self._recorder
         if recorder is not None:
             log_status = recorder.status()

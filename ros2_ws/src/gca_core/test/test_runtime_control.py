@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 from threading import Event
-from time import monotonic, sleep
+from time import monotonic, monotonic_ns, sleep
 
 import pytest
 from gca.config import RuntimeConfig
@@ -19,6 +19,7 @@ from gca.domain.models import (
     ServoSample,
 )
 from gca.runtime import ControlRuntime
+from gca.simulation.teleop_report import scripted_quality
 
 
 def wait_for(predicate, timeout=3.0):
@@ -186,6 +187,7 @@ def test_jog_deadman_and_short_ttl_stop(runtime):
         axis_mask=1,
         freshness_token="token",
         ttl_s=0.1,
+        quality=scripted_quality(monotonic_ns(), 1),
     )
     assert runtime.jog(jog).accepted
     wait_for(lambda: runtime.snapshot().state == "READY")
@@ -563,6 +565,7 @@ def test_jog_duration_is_capped_by_receiver_fixed_deadline():
         freshness_token="token",
         ttl_s=0.5,
         admission_deadline_ns=1_200_000_000,
+        quality=scripted_quality(1_150_000_000, 1),
     )
     now[0] = 1_150_000_000
     assert runtime._handle_jog(jog, now[0]).accepted
@@ -702,3 +705,110 @@ def test_stop_can_confirm_output_without_unlatching_fault_until_explicit_reset()
     assert runtime._handle("reset", None, now[0]).accepted
     assert runtime.snapshot().state == "DISARMED"
     assert runtime.snapshot().error_code == ""
+
+
+def test_stop_wins_final_velocity_transaction_gate_before_sdk_write(runtime):
+    """A barrier before final I/O lock reproduces check/write STOP ordering."""
+    from threading import current_thread
+
+    armed(runtime)
+    assert runtime.jog(
+        JogCommand(
+            CommandContext("session", "manual", "gate", 1, 1),
+            2,
+            0,
+            1,
+            "token",
+            0.5,
+            quality=scripted_quality(monotonic_ns(), 1, age_s=0.15),
+        )
+    ).accepted
+    wait_for(lambda: runtime.snapshot().applied_velocity_mm_s > 0)
+    runtime._freeze_control = True
+    assert runtime._control_paused.wait(1)
+    before, release = Event(), Event()
+    original_lock = runtime._stop_lock
+    writes = []
+    original_write = runtime.servo.write_velocity
+
+    def write(value, deadline):
+        writes.append(value)
+        return original_write(value, deadline)
+
+    runtime.servo.write_velocity = write
+
+    class Gate:
+        def __enter__(self):
+            if current_thread().name == "gca-servo-io" and not before.is_set():
+                before.set()
+                assert release.wait(1)
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, *args):
+            original_lock.release()
+
+    runtime._stop_lock = Gate()
+    try:
+        assert before.wait(1)
+        demand = runtime._velocity_demand.get()
+        runtime._velocity_demand.put(replace(demand, seq=demand.seq + 100))
+        assert runtime.stop("B", context=CommandContext("session", "manual", "B", 1, 2)).accepted
+        release.set()
+        sleep(0.03)
+        assert not any(value != 0 for value in writes)
+        assert not runtime._permit
+    finally:
+        release.set()
+        runtime._stop_lock = original_lock
+        runtime._freeze_control = False
+
+
+def test_stop_wins_final_pulse_transaction_gate_before_finite_submit(runtime):
+    from threading import current_thread
+
+    armed(runtime)
+    before, release = Event(), Event()
+    original_lock = runtime._stop_lock
+    submitted = []
+    original_submit = runtime.pulse.submit
+
+    def submit(segment):
+        submitted.append(segment)
+        return original_submit(segment)
+
+    class Gate:
+        def __enter__(self):
+            if current_thread().name == "gca-pulse-io" and not before.is_set():
+                before.set()
+                assert release.wait(1)
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, *args):
+            original_lock.release()
+
+    runtime.pulse.submit = submit
+    runtime._stop_lock = Gate()
+    try:
+        assert runtime.jog(
+            JogCommand(
+                CommandContext("session", "manual", "gate-pulse", 1, 1),
+                0,
+                30,
+                3,
+                "token",
+                0.14,
+                quality=scripted_quality(monotonic_ns(), 1),
+            )
+        ).accepted
+        assert before.wait(1)
+        assert runtime.stop("B", context=CommandContext("session", "manual", "B", 1, 2)).accepted
+        release.set()
+        wait_for(lambda: runtime.snapshot().stop_progress == "CONFIRMED")
+        assert submitted == []
+        assert runtime.snapshot().confirmed_pulses == 0
+        assert runtime.plant.snapshot().mechanical_angle_deg == 0
+    finally:
+        release.set()
+        runtime._stop_lock = original_lock

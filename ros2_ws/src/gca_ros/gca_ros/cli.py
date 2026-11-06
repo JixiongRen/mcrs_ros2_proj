@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import rclpy
+from gca.domain.manual import ManualInputQuality, host_clock_id
 from gca_system_interfaces.action import ExecuteMotion
 from gca_system_interfaces.msg import CommandContext, GcaState, JogCommand
 from gca_system_interfaces.srv import (
@@ -36,6 +37,8 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
+
+from .conversion import quality_to_ros
 
 
 @dataclass
@@ -257,7 +260,11 @@ class GcaClient:
             response = self.call(ManageDevice, "/system/" + operation, request)
             if response.state.generation:
                 self.credentials.generation = response.state.generation
-            return self._require(response)
+            self._require(response)
+            if operation == "arm":
+                ack = ControlSession.Request(context=self.context(), token=self.credentials.token)
+                self._require(self.call(ControlSession, "/system/acknowledge_generation", ack))
+            return response
 
     def wait_state(self, predicate, timeout_s=5.0):
         deadline = time.monotonic() + timeout_s
@@ -334,11 +341,35 @@ class GcaClient:
         linear_mm_s = finite_float(linear_mm_s, "linear_mm_s")
         rotation_deg_s = finite_float(rotation_deg_s, "rotation_deg_s")
         duration_s = finite_float(duration_s, "duration_s")
-        until = time.monotonic() + duration_s
+        if not 0 < duration_s <= 3600.0:
+            raise ValueError("duration_s must be within (0, 3600] seconds")
+        start_ns = time.monotonic_ns()
+        episode_end_ns = start_ns + int(duration_s * 1e9)
+        epoch = uuid.uuid4().hex
+        sample_seq = 0
+        until = episode_end_ns / 1e9
         try:
             while time.monotonic() < until:
                 context = self.context()
+                sample_seq += 1
+                observed = time.monotonic_ns()
+                quality = ManualInputQuality(
+                    "PROGRAMMED_JOG",
+                    "gca_cli",
+                    epoch,
+                    1,
+                    start_ns,
+                    "PROGRAMMED_EPISODE",
+                    sample_seq,
+                    observed,
+                    min(observed + 150_000_000, episode_end_ns),
+                    host_clock_id(),
+                    "PROGRAMMED",
+                    episode_end_ns=episode_end_ns,
+                )
                 permit = self.motion_permit(context, 0.15)
+                if time.monotonic_ns() >= quality.valid_until_ns:
+                    continue
                 msg = JogCommand(
                     context=context,
                     token=permit.token,
@@ -347,6 +378,7 @@ class GcaClient:
                     linear_velocity_m_s=linear_mm_s / 1000.0,
                     rotation_velocity_rad_s=math.radians(rotation_deg_s),
                     ttl_s=0.15,
+                    quality=quality_to_ros(quality),
                 )
                 self._jog_pub.publish(msg)
                 time.sleep(0.04)

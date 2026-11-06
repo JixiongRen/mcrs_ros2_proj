@@ -30,12 +30,24 @@ runtime:
   kd: null
   kaw: null
   integral_limit_mm_s: null
+  jog_velocity_kp: null           # External encoder velocity loop, independent of position PID.
+  jog_velocity_ki: null
+  jog_velocity_kaw: null
+  jog_integral_limit_mm_s: null
+  jog_velocity_filter_s: null
+  jog_dt_max_s: null
+  manual_input_max_age_s: null
+  jog_phase_gain_s: null
   position_tolerance_mm: null
   velocity_tolerance_mm_s: null
   settle_s: null
   pulses_per_motor_rev: null      # Legacy 6400/25600 conflict: inspect actual switches.
   catheter_per_motor_ratio: null  # Catheter angle / motor angle, independently measured.
   pulse_segment_s: null
+  pulse_high_us: null             # Must match devices.pulse and new waveform HIL.
+  pulse_low_us: null
+  direction_setup_us: null
+  direction_hold_us: null
   hardware_verified: false
 
 devices:

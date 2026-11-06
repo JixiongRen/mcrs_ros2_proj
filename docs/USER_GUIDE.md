@@ -2,6 +2,8 @@
 
 以下步骤使用安装后的入口和模拟设备。普通 launch 不会 ARM、设参考或开始运动；演示命令和交互 shell 会按操作者明确输入的命令执行模拟动作。
 
+手柄输入请使用 [手柄与模拟操作指南](TELEOP_USER_GUIDE.md)：先在工程根运行 `python3 tools/joystick_monitor.py`，即可独立查看原始输入日志，无需启动ROS；加已标定的 `--profile` 可查看操作判定。接入模拟执行器时，`gca_teleop_cli`复用持续运行的owner，不与下述交互shell同时claim。实体映射/无线资格和执行器HIL分开验收；默认实体profile保持锁定。
+
 ## 从新终端开始
 
 先从项目根目录完成 `bash tools/bootstrap_dev.sh` 和 `bash tools/verify_software.sh`。每个操作终端执行：
@@ -49,7 +51,7 @@ quit
 
 `reference` 的单位为 mm 和 deg，表示把当前位置赋给指定的软件参考，不驱动机构回原点，也不改编码器 EEPROM。只在静止且 DISARMED 时设置参考。参考完成后 ARM 才允许执行；active 本身不授权运动。
 
-`move 5 20` 是绝对目标；`relative` 相对目标只在准入时转换一次。成功结果包含 `outcome=1`、最终位置／角度估计以及 `stop_confirmed=true`。旋转数值是已确认脉冲的换算，不能用它证明实际机械角度。`jog` 在所给时段内发送新鲜输入，结束后发送 deadman 释放；输入停止或续租失败会使旧速度到期。
+`move 5 20` 是绝对目标；`relative` 相对目标只在准入时转换一次。成功结果包含 `outcome=1`、最终位置／角度估计以及 `stop_confirmed=true`。旋转数值是已确认脉冲的换算，不能用它证明实际机械角度。`jog` 为一次固定总终点的PROGRAMMED_JOG，后续帧不能延长该episode，结束后发送deadman释放；输入停止或续租失败会使旧速度到期。推进使用外部编码器速度PI；回中是减速到零，不追赶历史位置或隐式HOLD。旋转仍是开环：LT/deadman中止计数未知时参考失效，需要显式DISARM、确认位置并reference、ARM后再操作，不能直接续用旧角度。
 
 业务状态：DISARMED → READY → EXECUTING → READY。请求停止时可见 REQUESTED／IN_PROGRESS，确认后变为 CONFIRMED。出现 FAULT 或 UNKNOWN 时先读错误和停止证据，不重复盲发运动。
 
