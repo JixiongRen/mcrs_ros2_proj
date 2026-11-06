@@ -34,6 +34,18 @@ gca_source_install
 
 终端 B：`ros2 run gca_ros gca_cli shell`，按 [用户指南](docs/USER_GUIDE.md) 领取控制权、设参考、ARM、运动和停止。也可运行 `ros2 run gca_ros gca_cli demo --scenario basic --output artifacts/manual-demo`，显式执行模拟双轴动作。
 
+## 手柄控制
+
+先在项目根目录运行独立输入监视器，直接观察实体手柄数据；此步骤无需 ROS 2，不驱动执行器：
+
+```bash
+python3 tools/joystick_monitor.py
+```
+
+完整启用流程见[手柄控制启用与测试指南](docs/TELEOP_USER_GUIDE.md)：加载已标定配置，启动 `teleop_simulation.launch.py`，通过 `gca_teleop_cli` 完成配置、激活、领取控制权、设参考及 ARM，再检查推进、旋转、LT 和 B。手柄节点持有控制权时，管理命令使用同一代理，不同时运行 `gca_cli shell` 领取另一份控制权。
+
+当前实体输入的 `event_age` 模式在静态保持约 0.15 秒后停车；本机标定文件位于不进入 Git 的 `artifacts/`，新克隆须另行完成映射采集。实体持续双轴控制、无线资格及真实执行器尚未验收，指南中的运动步骤使用模拟执行器。
+
 ## 目录与阅读路径
 
 | 位置 | 作用 |

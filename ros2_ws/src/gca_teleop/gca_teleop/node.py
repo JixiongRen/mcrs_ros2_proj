@@ -30,6 +30,7 @@ from .input.joydev import NativeJoydev
 from .input.scripted import ScriptedInput
 from .management import ManagementServer, default_socket
 from .model import InputHealth, Intent
+from .recording import FeedbackRecord, actions, mapped_record
 from .session import ManualSession
 from .state_machine import TeleopPipeline
 
@@ -66,6 +67,7 @@ class TeleopNode(Node):
         self._script_started_ns = 0
         records = self.get_parameter("record_directory").value
         self._recorder = AsyncRecorder(records) if records else None
+        self._feedback_record = FeedbackRecord()
         self._session = ManualSession(self, notify=self._record)
         qos = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE
@@ -153,6 +155,10 @@ class TeleopNode(Node):
                                 "frame": asdict(frame),
                                 "health": asdict(health),
                                 "intent": asdict(intent),
+                                "mapped": mapped_record(frame, self.profile),
+                                "requested_actions": actions(
+                                    intent.linear_mm_s, intent.rotation_deg_s
+                                ),
                                 "monotonic_ns": time.monotonic_ns(),
                             }
                         )
@@ -515,6 +521,17 @@ class TeleopNode(Node):
             msg.estimated_rotation_rad_s = state.estimated_rotation_velocity_rad_s
             msg.estimated_rotation_velocity_valid = state.rotation_estimate_valid
         self._state_pub.publish(msg)
+        if self._recorder is not None:
+            self._record(
+                {
+                    "kind": "motion_sample",
+                    "monotonic_ns": time.monotonic_ns(),
+                    "intent": asdict(intent),
+                    "requested_actions": actions(intent.linear_mm_s, intent.rotation_deg_s),
+                    "feedback": self._feedback_record.sample(state, self._session.backend),
+                    "recorder": asdict(self._recorder.status()),
+                }
+            )
 
     def close(self):
         self._closing.set()

@@ -8,7 +8,7 @@
 | 新使用者 1 | [根 README](../README.md) | 安装、构建、无硬件运行 |
 | 新使用者 2 | [用户指南](USER_GUIDE.md) | 控制权、参考、ARM、动作、停止与恢复 |
 | 新使用者 3 | [仿真与测试](SIMULATION_AND_TESTING.md) | 如何读原始记录、曲线、错误和测试报告 |
-| 手柄使用者 | [手柄与模拟操作指南](TELEOP_USER_GUIDE.md) | 独立终端输入诊断、probe/launch/同owner管理、静态保持限制及参考恢复 |
+| 手柄使用者 | [手柄控制启用与测试指南](TELEOP_USER_GUIDE.md) | 终端读取检查、实体手柄启用步骤、动作与偏移文本记录、模拟运动判据、停止退出与故障处理 |
 | 手柄维护者 | [JF/JT追踪](TELEOP_TRACEABILITY.md) | 修复源码、具体回归和软件/实体/HIL证据边界 |
 | 手柄接入设计 | [Xbox按键约定](TELEOP_DESIGN.md) | 原始左摇杆/LT/B与右侧磁场预留约定；当前操作读手柄指南 |
 | 手柄实施准备 | [实现与可控性验证方案](TELEOP_IMPLEMENTATION_PLAN.md) | 实现依据、原始JF缺陷与JT01–JT20预声明判据；执行状态见状态文档 |
