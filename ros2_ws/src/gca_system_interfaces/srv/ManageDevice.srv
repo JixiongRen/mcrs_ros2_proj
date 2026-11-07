@@ -1,5 +1,9 @@
 CommandContext context
 string token
+# Hardware servo ARM requires a current qualified reader observation.
+# All other management operations and legacy dual-axis calls leave this false.
+bool has_input_quality
+ManualInputQuality input_quality
 uint8 axis_mask
 float64 linear_m
 float64 rotation_rad

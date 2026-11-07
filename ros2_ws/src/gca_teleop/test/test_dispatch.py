@@ -2,6 +2,7 @@ from concurrent.futures import Future
 from threading import Event, Thread
 from types import SimpleNamespace
 
+import pytest
 from gca_teleop.dispatch import LatestDispatcher
 
 
@@ -38,6 +39,8 @@ def intent(clock, observation=1, velocity=2.0):
         deadman=True,
         linear_mm_s=velocity,
         rotation_deg_s=0.0,
+        control_policy="LEGACY_DUAL_AXIS",
+        servo_rpm=0.0,
         quality=SimpleNamespace(
             valid_until_ns=clock.now + 150_000_000, input_epoch="input", observation_seq=observation
         ),
@@ -86,10 +89,15 @@ def test_stop_or_owner_change_drops_late_reply_without_publishing():
         assert dispatcher.inflight_count == 0
 
 
-def test_original_input_deadline_is_not_extended_by_slow_permit():
+@pytest.mark.parametrize("max_ttl_s", (0.15, 0.30))
+def test_original_input_deadline_is_not_extended_by_slow_permit(max_ttl_s):
     clock, session, sent, failures = Clock(), Session(), [], []
     dispatcher = LatestDispatcher(
-        session, lambda *args: sent.append(args), clock=clock, failure=failures.append
+        session,
+        lambda *args: sent.append(args),
+        max_ttl_s=max_ttl_s,
+        clock=clock,
+        failure=failures.append,
     )
     first = intent(clock)
     clock.now += 100_000_000
@@ -100,6 +108,25 @@ def test_original_input_deadline_is_not_extended_by_slow_permit():
     dispatcher.pump()
     assert failures == ["PERMIT_INPUT_EXPIRED"]
     assert not sent and dispatcher.inflight_count == 0
+
+
+@pytest.mark.parametrize("options,expected_ttl", (({}, 0.15), ({"max_ttl_s": 0.30}, 0.25)))
+def test_permit_ttl_uses_configured_limit_and_original_sample_deadline(options, expected_ttl):
+    clock, session, sent = Clock(), Session(), []
+    dispatcher = LatestDispatcher(
+        session, lambda *args: sent.append(args), clock=clock, **options
+    )
+    first = intent(clock)
+    deadline = clock.now + 300_000_000
+    first.quality.valid_until_ns = deadline
+    clock.now += 50_000_000
+    dispatcher.offer(first)
+    dispatcher.pump()
+    assert session.requests[0][1] == pytest.approx(expected_ttl)
+    clock.now += 50_000_000
+    session.requests[0][2].set_result(SimpleNamespace(accepted=True, token="nonce"))
+    assert len(sent) == 1 and sent[0][0] is first
+    assert sent[0][0].quality.valid_until_ns == deadline
 
 
 def test_rejected_permit_requests_stop_and_never_publishes():

@@ -277,6 +277,10 @@ def validate_mapping_evidence(profile, identity, *, evidence=None):
     if profile.source == "scripted":
         return "SYNTHETIC_PROFILE"
     data = read_evidence(profile.mapping_evidence) if evidence is None else evidence
+    if data.get("schema_version") == 3:
+        from .mode_confirmation import validate_mode_confirmation
+
+        return validate_mode_confirmation(profile, identity, data)
     if (
         data.get("schema_version") != 2
         or data.get("status") != "PASS"

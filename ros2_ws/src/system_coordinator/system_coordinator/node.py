@@ -11,11 +11,11 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 
 import rclpy
-from gca.domain.manual import QualityTracker
+from gca.domain.manual import QualityError, QualityTracker
 from gca_ros.conversion import quality_from_ros
-from gca_ros.permits import MotionPermits, capability_part, same_motion_payload
+from gca_ros.permits import MotionPermits, PermitError, capability_part, same_motion_payload
 from gca_system_interfaces.action import ExecuteMotion
-from gca_system_interfaces.msg import CommandContext, GcaState, JogCommand
+from gca_system_interfaces.msg import CommandContext, GcaState, JogCommand, ServoJogCommand
 from gca_system_interfaces.srv import (
     ApplyConfig,
     ControlSession,
@@ -52,6 +52,8 @@ class _Task:
 class SystemCoordinator(Node):
     """Forward requests only while their source and device capabilities are valid."""
 
+    _profile = "gca_only"
+
     def __init__(self):
         super().__init__("system_coordinator")
         self.declare_parameter("coordinator_key", "")
@@ -60,10 +62,10 @@ class SystemCoordinator(Node):
         self.declare_parameter("rpc_timeout_s", 2.0)
         self.declare_parameter("handover_timeout_s", 2.0)
         self.declare_parameter("profile", "gca_only")
-        if self.get_parameter("profile").value != "gca_only":
-            raise ValueError(
-                "Only explicit gca_only profile is enabled; magnetic experiments are not downgraded"
-            )
+        self.declare_parameter("servo_config_file", "")
+        self._profile = self.get_parameter("profile").value
+        if self._profile not in ("gca_only", "servo"):
+            raise ValueError("Only explicit gca_only and servo profiles are enabled")
         self._lock = threading.RLock()
         self._closing = False
         self._rpc_waits = {}
@@ -86,6 +88,8 @@ class SystemCoordinator(Node):
             raise ValueError("executor_lease_s must be finite between 0.1 and 5")
         self.action_group = MutuallyExclusiveCallbackGroup()
         self.management_group = MutuallyExclusiveCallbackGroup()
+        # Management awaits downstream RPCs; do not queue permits behind them.
+        self.permit_group = MutuallyExclusiveCallbackGroup()
         self.stop_group = MutuallyExclusiveCallbackGroup()
         self.fault_group = MutuallyExclusiveCallbackGroup()
         self.clients_group = ReentrantCallbackGroup()
@@ -95,7 +99,24 @@ class SystemCoordinator(Node):
         self._denials = OrderedDict()
         self._highwater = {}
         self._motion_permits = MotionPermits()
-        self._quality = QualityTracker()
+        servo_config_file = self.get_parameter("servo_config_file").value
+        self._held_servo_input = False
+        if servo_config_file:
+            if self._profile != "servo":
+                raise ValueError("servo_config_file requires the servo profile")
+            from gca.servo_config import load_servo_settings
+
+            settings = load_servo_settings(servo_config_file)
+            self._held_servo_input = settings.manual_hold_enabled
+            self._quality = QualityTracker(
+                backend=settings.backend,
+                max_age_s=settings.manual_input_max_age_s,
+                capacity=settings.history_capacity,
+                allow_joydev_hold=settings.manual_hold_enabled,
+            )
+        else:
+            # Existing launch files retain the qualified/legacy contract.
+            self._quality = QualityTracker()
         self._stop_epoch = 0
         self._pending_jog = None
         self._jog_forwarding = False
@@ -118,7 +139,7 @@ class SystemCoordinator(Node):
             ControlSession,
             "/system/get_motion_permit",
             self._motion_permit,
-            callback_group=self.management_group,
+            callback_group=self.permit_group,
         )
         self._manage_clients = {
             name: self.create_client(
@@ -189,9 +210,14 @@ class SystemCoordinator(Node):
         qos = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE
         )
-        self._jog_pub = self.create_publisher(JogCommand, "/gca/jog", qos)
+        jog_type = ServoJogCommand if self._profile == "servo" else JogCommand
+        jog_topic = "/gca/servo_jog" if self._profile == "servo" else "/gca/jog"
+        manual_topic = (
+            "/system/servo_manual_target" if self._profile == "servo" else "/system/manual_target"
+        )
+        self._jog_pub = self.create_publisher(jog_type, jog_topic, qos)
         self.create_subscription(
-            JogCommand, "/system/manual_target", self._jog, qos, callback_group=self.action_group
+            jog_type, manual_topic, self._jog, qos, callback_group=self.action_group
         )
         state_qos = QoSProfile(
             depth=1,
@@ -374,14 +400,23 @@ class SystemCoordinator(Node):
         request.token = source.executor_token
         request.lease_s = duration
         request.release = release
+        if self._profile == "gca_only":
+            request.control_policy = "LEGACY_DUAL_AXIS"
+        elif source.mode == "MANUAL":
+            request.control_policy = "MANUAL_SERVO_VELOCITY"
+        elif source.mode == "AUTO":
+            request.control_policy = "POSITION_EXTERNAL_ENCODER"
+        else:
+            raise SessionError("CONTROL_MODE_UNSUPPORTED")
         return request
 
     def _motion_permit(self, request, response):
         try:
-            source = self._verify(request.context, request.token)
-            envelope, deadline = self._motion_permits.issue(
-                source.token, request.context, request.lease_s, source.deadline
-            )
+            with self._lock:
+                source = self._verify(request.context, request.token)
+                envelope, deadline = self._motion_permits.issue(
+                    source.token, request.context, request.lease_s, source.deadline
+                )
             response.accepted = True
             response.error_code = "OK"
             response.context = request.context
@@ -621,6 +656,10 @@ class SystemCoordinator(Node):
     def _goal(self, request):
         try:
             source = self._verify(request.context, capability_part(request.token))
+            if self._profile == "servo":
+                if source.mode != "AUTO":
+                    raise SessionError("AUTO_MODE_REQUIRED")
+                raise SessionError("EXTERNAL_ENCODER_POSITION_UNSUPPORTED")
             if not self._state.lifecycle_active or not self._state.armed:
                 raise SessionError("NOT_ARMED")
             if self._state.state != "READY":
@@ -838,11 +877,14 @@ class SystemCoordinator(Node):
         self._enqueue(record, result)
 
     def _jog(self, request):
+        stage = "authorization"
         try:
             if not request.deadman:
+                stage = "deadman_authorization"
                 base = capability_part(request.token) if "." in request.token else request.token
                 source = self._stop_verify(request.context, base)
                 with self._lock:
+                    stage = "deadman_fence"
                     self._fence_stop(request.context, source)
                     identity = (source.session_id, source.generation)
                     if self._jog_stopping is None or self._jog_stopping[:2] != identity:
@@ -856,9 +898,17 @@ class SystemCoordinator(Node):
                         )
                 return
             source = self._verify(request.context, capability_part(request.token))
+            stage = "input_policy"
             if source.mode != "MANUAL":
                 raise SessionError("MANUAL_MODE_REQUIRED")
+            if request.quality.source_kind == "JOYDEV_HELD_ARM":
+                raise SessionError("ARM_PROOF_CANNOT_JOG")
+            if self._profile == "servo" and self._held_servo_input:
+                if request.quality.source_kind != "JOYDEV_HELD_STATE":
+                    raise SessionError("JOYDEV_HELD_STATE_REQUIRED")
+            stage = "motion_permit"
             deadline = self._motion_permits.consume(request.token, request.context)
+            stage = "input_quality"
             input_deadline = self._quality.validate(
                 quality_from_ros(request.quality),
                 time.monotonic_ns(),
@@ -867,13 +917,24 @@ class SystemCoordinator(Node):
             )
             deadline = min(deadline, input_deadline / 1e9)
             with self._lock:
+                stage = "mailbox_authorization"
                 source = self._verify(request.context, capability_part(request.token))
+                stage = "mailbox_fence"
                 self._motion_permits.check_fence(request.context)
                 self._pending_jog = (copy.deepcopy(request), source, deadline, self._jog_epoch)
                 if not self._jog_forwarding:
                     self._jog_forwarding = True
                     self.executor.create_task(self._forward_jog)
-        except (SessionError, ValueError):
+        except (SessionError, ValueError) as exc:
+            code = (
+                str(exc)
+                if isinstance(exc, (SessionError, PermitError, QualityError))
+                else "INVALID_ARGUMENT"
+            )
+            self.get_logger().warning(
+                f"JOG_REJECTED stage={stage} sequence={request.context.sequence} "
+                f"monotonic_ns={time.monotonic_ns()} code={code}"
+            )
             return
 
     async def _forward_jog(self):
@@ -885,20 +946,45 @@ class SystemCoordinator(Node):
                     if pending is None:
                         return
                 request, source, deadline, epoch = pending
+                stage = "device_permit"
                 try:
                     permit = await self._device_motion_permit(source, request.context, deadline)
+                    stage = "forward_authorization"
                     self._verify(request.context, capability_part(request.token))
+                    stage = "forward_fence"
                     self._motion_permits.check_fence(request.context)
                     with self._lock:
                         if epoch != self._jog_epoch:
+                            self.get_logger().warning(
+                                "JOG_REJECTED stage=forward_epoch "
+                                f"sequence={request.context.sequence} "
+                                f"monotonic_ns={time.monotonic_ns()} code=JOG_EPOCH_CHANGED"
+                            )
                             continue
+                    stage = "forward_deadline"
                     request.token = permit.token
                     request.ttl_s = float(
                         min(request.ttl_s, permit.granted_lease_s, deadline - time.monotonic())
                     )
                     if request.ttl_s > 0:
+                        stage = "publish"
                         self._jog_pub.publish(request)
-                except (SessionError, TimeoutError, ValueError):
+                    else:
+                        self.get_logger().warning(
+                            f"JOG_REJECTED stage={stage} sequence={request.context.sequence} "
+                            f"monotonic_ns={time.monotonic_ns()} code=NO_REMAINING_JOG_TTL"
+                        )
+                except (SessionError, TimeoutError, ValueError) as exc:
+                    if isinstance(exc, (SessionError, PermitError)):
+                        code = str(exc)
+                    elif isinstance(exc, TimeoutError):
+                        code = "RPC_TIMEOUT"
+                    else:
+                        code = "INVALID_ARGUMENT"
+                    self.get_logger().warning(
+                        f"JOG_REJECTED stage={stage} sequence={request.context.sequence} "
+                        f"monotonic_ns={time.monotonic_ns()} code={code}"
+                    )
                     continue
         finally:
             self._finish_jog_worker()
@@ -953,15 +1039,20 @@ class SystemCoordinator(Node):
                     "session_id",
                     "sample_seq",
                 )
-                if (
-                    any(getattr(state, name) != getattr(current, name) for name in identity)
-                    or state.feedback_age_s <= current.feedback_age_s
-                ):
+                newer_stop = self._profile == "servo" and state.stop_serial > current.stop_serial
+                if any(getattr(state, name) != getattr(current, name) for name in identity):
+                    return False
+                if state.feedback_age_s <= current.feedback_age_s and not newer_stop:
                     return False
                 updated = copy.deepcopy(current)
                 updated.feedback_age_s = state.feedback_age_s
                 updated.linear_valid = state.linear_valid
                 updated.linear_velocity_valid = state.linear_velocity_valid
+                if self._profile == "servo":
+                    updated.servo = copy.deepcopy(state.servo)
+                    if newer_stop:
+                        updated.stop_serial = state.stop_serial
+                        updated.stop = copy.deepcopy(state.stop)
                 updated.stamp = state.stamp
                 self._state = updated
                 return True

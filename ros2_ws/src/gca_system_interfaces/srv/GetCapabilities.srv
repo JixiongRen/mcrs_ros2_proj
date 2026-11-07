@@ -1,6 +1,11 @@
 ---
 string backend
 bool simulation
+string control_profile
+string servo_config_sha256
+bool can_servo_velocity
+bool can_measure_servo
+float64 max_servo_velocity_rad_s
 bool can_linear_motion
 bool can_rotation_motion
 bool can_stop

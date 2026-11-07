@@ -6,7 +6,7 @@ find_package(builtin_interfaces REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CommandContext.msg" "msg/MotionTarget.msg" "msg/MotionLimits.msg"
   "msg/StopStatus.msg" "msg/GcaState.msg" "msg/ManualInputQuality.msg"
-  "msg/JogCommand.msg" "msg/TeleopState.msg"
+  "msg/JogCommand.msg" "msg/TeleopState.msg" "msg/ServoJogCommand.msg" "msg/ServoState.msg"
   "srv/ControlSession.srv" "srv/ManageDevice.srv" "srv/ExecutionLease.srv"
   "srv/GetCommandStatus.srv" "srv/GetCapabilities.srv" "srv/ApplyConfig.srv"
   "srv/InjectFault.srv" "action/ExecuteMotion.action"

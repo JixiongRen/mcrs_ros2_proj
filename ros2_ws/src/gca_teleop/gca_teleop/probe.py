@@ -520,9 +520,10 @@ def _write_profile(path, profile):
         stream.write(text)
 
 
-def _collect(source, seconds):
+def _collect(source, seconds, *, frames=None):
     deadline = monotonic_ns() + int(seconds * 1e9)
-    frames = []
+    if frames is None:
+        frames = []
     while monotonic_ns() < deadline:
         frames.extend(source.poll())
         if len(frames) > 10_000:
@@ -608,37 +609,78 @@ def main(argv=None):
         wizard = QualificationWizard(profile, identity, args.max_disconnect_s)
         for case in wizard.CASES:
             for trial in range(3):
-                input(
-                    f"{case} trial {trial + 1}/3: reconnect, hold LT and nonzero left; Enter to sample: "
-                )
-                source.close()
-                source.open()
-                held_frames = _collect(source, 0.08)
-                # Held baseline alone is not an actuation observation. Ask for
-                # a small left movement while retaining LT, captured read-only.
-                print("Keep LT held and move left stick slightly now.")
-                held_frames.extend(_collect(source, args.capture_s))
-                candidates = [f for f in held_frames if f.event_seq and f.changed_axes]
-                if not candidates:
-                    raise InputError("NO_HELD_PHYSICAL_EVENT")
-                held = candidates[-1]
-                # External action timestamp is operator attestation, not a
-                # claim that software can observe the RF-loss onset itself.
-                print(
-                    f"Perform {case} NOW. Start is operator-attested local cue; keep holding controls."
-                )
-                start = monotonic_ns()
-                frames = _collect(source, args.max_disconnect_s + 0.05)
-                final_health = source.health()
-                attested = (
+                held_frames, frames = [], []
+                captured = {}
+                stage = "operator_prepare"
+                try:
                     input(
-                        f"Type CONFIRM only if you performed {case} and kept LT+left held throughout: "
+                        f"{case} trial {trial + 1}/3: reconnect, hold LT and nonzero left; Enter to sample: "
                     )
-                    == "CONFIRM"
-                )
-                wizard.add_trial(
-                    case, held, start, frames, final_health, operator_attested=attested
-                )
+                    stage = "reopen"
+                    source.close()
+                    source.open()
+                    stage = "held_baseline"
+                    _collect(source, 0.08, frames=held_frames)
+                    captured["last_health"] = asdict(source.health())
+                    # A cached held baseline is not an actuation observation.
+                    print("Keep LT held and move left stick slightly now.")
+                    stage = "held_movement"
+                    _collect(source, args.capture_s, frames=held_frames)
+                    captured["last_health"] = asdict(source.health())
+                    candidates = [f for f in held_frames if f.event_seq and f.changed_axes]
+                    if not candidates:
+                        raise InputError("NO_HELD_PHYSICAL_EVENT")
+                    held = candidates[-1]
+                    captured["selected_held_frame"] = asdict(held)
+                    # The cue is operator-attested, not an observed RF onset.
+                    print(
+                        f"Perform {case} NOW. Start is operator-attested local cue; keep holding controls."
+                    )
+                    start = monotonic_ns()
+                    captured["start_ns"] = start
+                    stage = "response_capture"
+                    _collect(source, args.max_disconnect_s + 0.05, frames=frames)
+                    final_health = source.health()
+                    captured["final_health"] = asdict(final_health)
+                    stage = "operator_attestation"
+                    attested = (
+                        input(
+                            f"Type CONFIRM only if you performed {case} and kept LT+left held throughout: "
+                        )
+                        == "CONFIRM"
+                    )
+                    captured["operator_attested"] = attested
+                    stage = "evaluate"
+                    checked = wizard.add_trial(
+                        case, held, start, frames, final_health, operator_attested=attested
+                    )
+                except (InputError, OSError, ValueError, EOFError, KeyboardInterrupt) as exc:
+                    # Keep partial observations separate from evaluated trials;
+                    # missing timestamps/health/attestation are never invented.
+                    captured["held_frames"] = [asdict(f) for f in held_frames]
+                    captured["response_frames"] = [asdict(f) for f in frames]
+                    result = dict(
+                        wizard.build(),
+                        status="FAIL",
+                        completed_trial_count=len(wizard.trials),
+                        incomplete_trial=dict(
+                            case=case,
+                            trial_number=trial + 1,
+                            stage=stage,
+                            error=f"{type(exc).__name__}: {exc}",
+                            raw_records=captured,
+                            raw_records_sha256=hashlib.sha256(_json_bytes(captured)).hexdigest(),
+                        ),
+                    )
+                else:
+                    if checked["status"] == "PASS":
+                        continue
+                    result = dict(wizard.build(), completed_trial_count=len(wizard.trials))
+                # Preserve a failed evaluated trial unchanged, or the explicit
+                # incomplete record above, and never start another trial.
+                _write(args.output, result)
+                print("FAIL")
+                return 1
         result = validate_qualification_output(profile, identity, wizard.build())
         _write(args.output, result)
         if result["status"] == "PASS":

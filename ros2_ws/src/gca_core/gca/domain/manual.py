@@ -53,6 +53,8 @@ class QualityTracker:
         clock_domain_id=None,
         capacity=128,
         programmed_max_s=3600.0,
+        *,
+        allow_joydev_hold=False,
     ):
         import math
 
@@ -64,11 +66,13 @@ class QualityTracker:
             or capacity < 1
             or not math.isfinite(programmed_max_s)
             or programmed_max_s <= 0
+            or type(allow_joydev_hold) is not bool
         ):
             raise ValueError("invalid manual quality limits")
         self.backend = backend
         self.max_age_ns = int(max_age_s * 1e9)
         self.programmed_max_ns = int(programmed_max_s * 1e9)
+        self.allow_joydev_hold = allow_joydev_hold
         self.clock_domain_id = clock_domain_id or host_clock_id()
         self.capacity = capacity
         self._history = {}
@@ -109,8 +113,11 @@ class QualityTracker:
                 raise QualityError("INVALID_MANUAL_QUALITY")
         if q.clock_domain_id != self.clock_domain_id:
             raise QualityError("INPUT_CLOCK_MISMATCH")
+        neutral_baseline = (
+            q.source_kind == "JOYDEV_HELD_ARM" and q.event_seq == 0 and q.event_ns == 0
+        )
         if (
-            q.event_seq < 1
+            (q.event_seq < 1 and not neutral_baseline)
             or q.observation_seq < 1
             or q.event_ns > q.observation_ns
             or q.observation_ns > now
@@ -135,6 +142,17 @@ class QualityTracker:
                 or q.episode_end_ns - q.event_ns > self.programmed_max_ns
             ):
                 raise QualityError("INVALID_PROGRAMMED_EPISODE")
+        elif q.source_kind in ("JOYDEV_HELD_STATE", "JOYDEV_HELD_ARM"):
+            if (
+                not self.allow_joydev_hold
+                or q.link_evidence != "UNKNOWN"
+                or q.qualification_id
+                or q.episode_end_ns != 0
+            ):
+                raise QualityError("HELD_INPUT_NOT_ENABLED")
+            # A fresh reader observation can preserve a physically unchanged
+            # control state. It is not evidence of a fresh radio packet.
+            origin = q.observation_ns
         else:
             raise QualityError("INVALID_INPUT_SOURCE")
         ceiling = origin + self.max_age_ns
@@ -144,6 +162,10 @@ class QualityTracker:
             raise QualityError("INPUT_DEADLINE_INVALID")
         if now >= q.valid_until_ns or now - q.observation_ns >= self.max_age_ns:
             raise QualityError("INPUT_EXPIRED")
+        if q.source_kind == "JOYDEV_HELD_ARM":
+            # Neutral ARM proof enables only a zero-target handshake, not an
+            # input episode. Runtime jog ingress rejects this source kind.
+            return q.valid_until_ns
         key = (session, generation, q.source_id)
         full = (*key, q.input_epoch)
         current = self._current.get(key)

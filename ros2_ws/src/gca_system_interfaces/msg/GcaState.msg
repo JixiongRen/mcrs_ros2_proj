@@ -4,6 +4,8 @@ string device_epoch
 uint64 state_seq
 string state
 string mode
+string control_policy
+ServoState servo
 bool lifecycle_active
 bool armed
 float64 linear_position_m

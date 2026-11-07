@@ -4,6 +4,8 @@ CommandContext context
 string token
 float64 lease_s
 bool release
+# Required and bound to the issued capability. Renewal cannot change policy.
+string control_policy
 ---
 bool accepted
 string error_code

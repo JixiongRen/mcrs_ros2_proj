@@ -73,3 +73,25 @@ def test_privileged_stop_bridge_spans_same_session_handover_but_not_new_owner():
     a.issue("coordinator-key", "second", 3, 1, 1.0)
     with pytest.raises(AccessError, match="STOP_SESSION_MISMATCH"):
         a.coordinator_stop("coordinator-key", "first")
+
+
+def test_execution_policy_cannot_be_omitted_at_ros_boundary_or_changed_on_renewal():
+    a = LeaseAuthority("coordinator-key", clock=lambda: 1.0)
+    with pytest.raises(AccessError, match="INVALID_CONTROL_POLICY"):
+        a.issue("coordinator-key", "first", 1, 1, 1.0, control_policy="")
+    grant = a.issue("coordinator-key", "first", 1, 1, 1.0, control_policy="MANUAL_SERVO_VELOCITY")
+    with pytest.raises(AccessError, match="CONTROL_POLICY_CHANGE_REQUIRES_RELEASE"):
+        a.issue(
+            "coordinator-key",
+            "first",
+            1,
+            2,
+            1.0,
+            grant.token,
+            control_policy="POSITION_EXTERNAL_ENCODER",
+        )
+    assert a.grant == grant
+    renewed = a.issue(
+        "coordinator-key", "first", 1, 2, 1.0, grant.token, control_policy="MANUAL_SERVO_VELOCITY"
+    )
+    assert renewed.control_policy == "MANUAL_SERVO_VELOCITY"

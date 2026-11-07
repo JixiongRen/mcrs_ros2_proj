@@ -35,11 +35,13 @@ class LatestDispatcher:
         session,
         publish,
         *,
+        max_ttl_s=0.15,
         clock=monotonic_ns,
         notify=lambda event: None,
         failure=lambda reason: None,
     ):
         self.session, self.publish, self.clock = session, publish, clock
+        self.max_ttl_s = max_ttl_s
         self.notify, self.failure = notify, failure
         self._lock = RLock()
         self._latest = None
@@ -121,7 +123,7 @@ class LatestDispatcher:
                         if not self._current(guard):
                             self.dropped_count += 1
                             return
-                        ttl_s = min(0.15, (intent.quality.valid_until_ns - now) / 1e9)
+                        ttl_s = min(self.max_ttl_s, (intent.quality.valid_until_ns - now) / 1e9)
                         future = self.session.permit_async(context, token, ttl_s)
                         flight = _Flight(
                             future, intent, context, guard.stop_epoch, guard.dispatch_epoch
@@ -190,6 +192,8 @@ class LatestDispatcher:
                         "valid_until_ns": flight.intent.quality.valid_until_ns,
                         "linear_mm_s": flight.intent.linear_mm_s,
                         "rotation_deg_s": flight.intent.rotation_deg_s,
+                        "control_policy": flight.intent.control_policy,
+                        "servo_rpm": flight.intent.servo_rpm,
                         "monotonic_ns": self.clock(),
                     }
                 )

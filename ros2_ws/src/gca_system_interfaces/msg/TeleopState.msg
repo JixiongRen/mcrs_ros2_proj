@@ -8,6 +8,10 @@ bool b_pressed
 bool session_owned
 bool armed
 string source_mode
+string control_policy
+float64 requested_servo_rad_s
+float64 measured_servo_rad_s
+bool servo_valid
 gca_system_interfaces/ManualInputQuality quality
 float64 requested_linear_m_s
 float64 requested_rotation_rad_s

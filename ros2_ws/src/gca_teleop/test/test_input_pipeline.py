@@ -639,10 +639,13 @@ def test_qualify_cli_requires_attestation_and_generates_inactive_contract(tmp_pa
 
     current = [held]
 
-    def collect(*args):
-        frames = queue.pop(0)
-        if frames:
-            current[0] = frames[-1]
+    def collect(*args, frames=None):
+        batch = queue.pop(0)
+        if batch:
+            current[0] = batch[-1]
+        if frames is None:
+            return batch
+        frames.extend(batch)
         return frames
 
     monkeypatch.setattr(probe, "NativeJoydev", Source)

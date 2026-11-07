@@ -14,6 +14,8 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 
+from gca.domain.manual import ManualInputQuality
+from gca_ros.conversion import quality_to_ros
 from gca_system_interfaces.msg import CommandContext, GcaState
 from gca_system_interfaces.srv import ControlSession, GetCapabilities, InjectFault, ManageDevice
 from lifecycle_msgs.srv import ChangeState, GetState
@@ -30,10 +32,24 @@ class _Credentials:
 
 
 class ManualSession:
-    def __init__(self, node, *, notify=lambda event: None, timeout_s=3.0):
+    def __init__(
+        self,
+        node,
+        *,
+        notify=lambda event: None,
+        timeout_s=3.0,
+        control_profile="dual_axis",
+        servo_settings=None,
+    ):
         if isinstance(timeout_s, bool) or not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout_s must be positive and finite")
         self.node, self.notify, self.timeout_s = node, notify, float(timeout_s)
+        if control_profile not in ("dual_axis", "servo"):
+            raise ValueError("UNKNOWN_CONTROL_PROFILE")
+        if (control_profile == "servo") != (servo_settings is not None):
+            raise ValueError("SERVO_SETTINGS_PROFILE_MISMATCH")
+        self.control_profile, self.servo_settings = control_profile, servo_settings
+        self._servo_capable = False
         self._lock = threading.RLock()
         self._management_lock = threading.Lock()
         self._closing = threading.Event()
@@ -48,11 +64,14 @@ class ManualSession:
         self._stop_epoch = 0
         self._stop_future = None
         self._stop_started_ns = 0
+        self._stop_deadline_ns = 0
+        self._stop_timed_out_epoch = 0
         self._stop_latest = None
         self._renew_future = None
         self._renew_started_ns = 0
         self._renew_after_ns = 0
         self._management_active = False
+        self._release_in_progress = False
         self._backend = ""
         self._backend_boot = ""
         self._capabilities_future = None
@@ -117,6 +136,7 @@ class ManualSession:
             if current.boot_id:
                 self._retired_boots.append(current.boot_id)
             self._backend = self._backend_boot = ""
+            self._servo_capable = False
         elif current is not None:
             if state.state_seq < current.state_seq:
                 return False
@@ -134,6 +154,7 @@ class ManualSession:
                     "reference_id",
                     "active_command_id",
                     "applied_config_revision",
+                    "control_policy",
                 )
                 if any(getattr(state, key) != getattr(current, key) for key in identity):
                     if state.stop_serial <= current.stop_serial:
@@ -143,12 +164,22 @@ class ManualSession:
                     state = merged
         if current is None or state.boot_id != current.boot_id:
             self._backend = self._backend_boot = ""
+            self._servo_capable = False
         self._state = copy.deepcopy(state)
-        self._state_ns = time.monotonic_ns()
+        if (
+            self.control_profile != "servo"
+            or current is None
+            or state.boot_id != current.boot_id
+            or state.state_seq > current.state_seq
+        ):
+            # Servo telemetry freshness measures progress, not repeated delivery.
+            self._state_ns = time.monotonic_ns()
         self._confirm_stop_locked()
         return True
 
     def _confirm_stop_locked(self):
+        if self._expire_stop_confirmation_locked(time.monotonic_ns()):
+            return
         receipt, state = self._stop_receipt, self._state
         if (
             receipt is not None
@@ -159,6 +190,20 @@ class ManualSession:
             and state.stop.progress == "CONFIRMED"
         ):
             self._stop_confirmed_epoch = max(self._stop_confirmed_epoch, receipt[0])
+
+    def _expire_stop_confirmation_locked(self, now):
+        if (
+            self.control_profile != "servo"
+            or self._stop_required_epoch <= self._stop_confirmed_epoch
+            or not self._stop_deadline_ns
+            or now < self._stop_deadline_ns
+        ):
+            return False
+        if self._stop_timed_out_epoch != self._stop_required_epoch:
+            self._stop_timed_out_epoch = self._stop_required_epoch
+            self.error = "STOP_CONFIRMATION_TIMEOUT"
+            self.notify({"kind": "stop_error", "error": self.error, "monotonic_ns": now})
+        return True
 
     def _stop_settled_locked(self):
         return (
@@ -211,6 +256,12 @@ class ManualSession:
         """Only the latest requested STOP's acknowledged serial can confirm."""
         with self._lock:
             self._confirm_stop_locked()
+            if self.control_profile == "servo" and (
+                self._state is None
+                or self._state.stop.progress != "CONFIRMED"
+                or time.monotonic_ns() - self._state_ns >= 500_000_000
+            ):
+                return False
             return self._stop_settled_locked()
 
     @property
@@ -225,29 +276,49 @@ class ManualSession:
 
     def gate(self):
         with self._lock:
+            self._expire_stop_confirmation_locked(time.monotonic_ns())
             state, c = self._state, self._credentials
             if state is None:
                 return dict(
                     armed=False, ready=False, reference_id="", session_key="", hardware=False
                 )
-            ready = bool(
+            if self.control_profile == "servo":
+                axes_ready = (
+                    self._servo_capable
+                    and state.control_policy == "MANUAL_SERVO_VELOCITY"
+                    and state.servo.configured
+                    and state.servo.valid
+                    and not state.servo.hardware_error
+                    and not state.servo.error_code
+                    and state.servo.sample_seq > 0
+                    and bool(state.servo.device_epoch)
+                    and state.applied_config_revision == self.servo_settings.revision
+                )
+            else:
+                axes_ready = (
+                    state.linear_reference_valid
+                    and state.rotation_reference_valid
+                    and state.rotation_estimate_valid
+                )
+            available = bool(
                 c
                 and self._backend
                 and not self.error
                 and not self._management_active
-                and self._stop_settled_locked()
-                and state.stop.progress == "CONFIRMED"
                 and state.session_id == c.session_id
                 and state.generation == c.generation
                 and time.monotonic_ns() - self._state_ns < 500_000_000
                 and state.lifecycle_active
-                and state.state in ("READY", "EXECUTING")
-                and state.linear_reference_valid
-                and state.rotation_reference_valid
-                and state.rotation_estimate_valid
+                and axes_ready
                 and state.requested_config_revision == state.applied_config_revision
             )
-            return dict(
+            ready = bool(
+                available
+                and self._stop_settled_locked()
+                and state.stop.progress == "CONFIRMED"
+                and state.state in ("READY", "EXECUTING")
+            )
+            result = dict(
                 armed=state.armed,
                 ready=ready,
                 reference_id=state.reference_id,
@@ -256,6 +327,21 @@ class ManualSession:
                 else "",
                 hardware=self._backend == "hardware",
             )
+            if self.control_profile == "servo":
+                # Device-local validity already enforces feedback_max_age_s.
+                # Only an otherwise healthy, owned STOP may retain a new LT edge.
+                result.update(
+                    stop_pending=bool(
+                        available
+                        and state.armed
+                        and not self._stop_settled_locked()
+                        and state.state in ("READY", "EXECUTING", "STOPPING")
+                        and state.stop.progress in ("CONFIRMED", "REQUESTED", "IN_PROGRESS")
+                    ),
+                    stop_epoch=self._stop_required_epoch,
+                )
+                result["session_key"] += ":" + state.servo.device_epoch
+            return result
 
     def context(self):
         with self._lock:
@@ -315,6 +401,15 @@ class ManualSession:
 
     def request_stop(self, reason="OPERATOR_STOP"):
         with self._lock:
+            if self.control_profile == "servo" and self._release_in_progress:
+                # Releasing has already fenced all producer output. Its final
+                # STOP remains pending/confirmed by its real receipt; a held B
+                # or finished script must not keep moving that receipt's goal.
+                return {
+                    "accepted": True,
+                    "stop_epoch": self._stop_required_epoch,
+                    "coalesced_with_release": True,
+                }
             self._stop_epoch += 1
             epoch = self._stop_epoch
             if self._credentials is None:
@@ -328,6 +423,8 @@ class ManualSession:
                 )
                 return {"accepted": True, "stop_epoch": epoch, "local_only": True}
             self._stop_required_epoch = epoch
+            if self.control_profile == "servo":
+                self._stop_deadline_ns = time.monotonic_ns() + int(self.timeout_s * 1e9)
             context, token = self.context()
             self._stop_latest = (ManageDevice.Request(context=context, token=token), reason, epoch)
             self._start_stop_locked()
@@ -466,11 +563,13 @@ class ManualSession:
         """Detach expired requests; the caller cancels them after releasing _lock."""
         abandoned = []
         budget = int(self.timeout_s * 1e9)
+        confirmation_expired = self._expire_stop_confirmation_locked(now)
         if self._stop_future is not None and now - self._stop_started_ns >= budget:
             expired, self._stop_future = self._stop_future, None
             abandoned.append(expired)
-            self.error = "STOP_TIMEOUT"
-            self.notify({"kind": "stop_error", "error": self.error, "monotonic_ns": now})
+            if not confirmation_expired:
+                self.error = "STOP_TIMEOUT"
+                self.notify({"kind": "stop_error", "error": self.error, "monotonic_ns": now})
             self._start_stop_locked()
         if self._capabilities_future is not None and now - self._capabilities_started_ns >= budget:
             expired, self._capabilities_future = self._capabilities_future, None
@@ -507,14 +606,39 @@ class ManualSession:
                     ):
                         if response.simulation != (response.backend == "simulation"):
                             raise RuntimeError("BACKEND_CAPABILITY_CONFLICT")
+                        if response.control_profile != self.control_profile:
+                            raise RuntimeError("CONTROL_PROFILE_MISMATCH")
+                        if self.control_profile == "servo":
+                            settings = self.servo_settings
+                            if (
+                                response.backend != settings.backend
+                                or response.servo_config_sha256 != settings.sha256
+                                or not response.can_servo_velocity
+                                or not response.can_measure_servo
+                                or not math.isclose(
+                                    response.max_servo_velocity_rad_s,
+                                    settings.max_rpm * 2.0 * math.pi / 60.0,
+                                    rel_tol=1e-12,
+                                    abs_tol=1e-12,
+                                )
+                            ):
+                                raise RuntimeError("SERVO_CAPABILITY_CONFIG_MISMATCH")
+                            self._servo_capable = True
                         self._backend = response.backend
                         self._backend_boot = boot
                 except Exception:
                     self._backend = ""
+                    self._servo_capable = False
 
         future.add_done_callback(complete)
 
-    def manage(self, operation, *, linear_mm=0.0, rotation_deg=0.0):
+    def manage(self, operation, *, linear_mm=0.0, rotation_deg=0.0, input_quality=None):
+        if input_quality is not None and (
+            operation != "arm"
+            or self.control_profile != "servo"
+            or not isinstance(input_quality, ManualInputQuality)
+        ):
+            raise ValueError("UNEXPECTED_ARM_INPUT_QUALITY")
         if not self._management_lock.acquire(blocking=False):
             raise RuntimeError("MANAGEMENT_BUSY")
         with self._lock:
@@ -556,7 +680,21 @@ class ManualSession:
                     self._renew_after_ns = time.monotonic_ns() + 350_000_000
                 return
             if operation == "release":
-                self.request_stop("OWNER_RELEASE")
+                with self._lock:
+                    self.request_stop("OWNER_RELEASE")
+                    self._release_in_progress = self.control_profile == "servo"
+                if self.control_profile == "servo":
+                    self._wait_stop_confirmed()
+                    context, token = self.context()
+                    response = self._require(
+                        self._call(
+                            "disarm",
+                            ManageDevice.Request(context=context, token=token, axis_mask=0),
+                        )
+                    )
+                    with self._lock:
+                        self._merge_state_locked(response.state, authoritative=True)
+                    self._wait_stop_confirmed(disarmed=True)
                 context, token = self.context()
                 try:
                     self._require(
@@ -589,10 +727,39 @@ class ManualSession:
             }.get(operation)
             if service is None:
                 raise ValueError("UNKNOWN_MANAGEMENT_OPERATION")
+            if operation == "reference" and self.control_profile == "servo":
+                raise ValueError("EXTERNAL_POSITION_CONTROL_UNAVAILABLE")
             if operation == "arm":
                 with self._lock:
                     if not self._stop_settled_locked():
                         raise RuntimeError("WAIT_FOR_STOP_ACK")
+                    if self.control_profile == "servo" and (
+                        not self._servo_capable
+                        or self._backend != self.servo_settings.backend
+                        or self._state is None
+                        or self._state.applied_config_revision != self.servo_settings.revision
+                    ):
+                        raise RuntimeError("SERVO_CAPABILITY_CONFIG_MISMATCH")
+                    if self.control_profile == "servo" and self._backend == "hardware":
+                        held = self.servo_settings.manual_hold_enabled
+                        if input_quality is None:
+                            raise RuntimeError("HARDWARE_INPUT_NOT_QUALIFIED")
+                        if held and (
+                            input_quality.source_kind != "JOYDEV_HELD_ARM"
+                            or input_quality.link_evidence != "UNKNOWN"
+                            or input_quality.qualification_id
+                            or input_quality.episode_end_ns != 0
+                            or input_quality.valid_until_ns - input_quality.observation_ns
+                            > int(self.servo_settings.manual_input_max_age_s * 1e9)
+                        ):
+                            raise RuntimeError("HARDWARE_INPUT_NOT_QUALIFIED")
+                        if not held and (
+                            input_quality.source_kind != "QUALIFIED_STATE_CONTRACT"
+                            or not input_quality.qualification_id
+                        ):
+                            raise RuntimeError("HARDWARE_INPUT_NOT_QUALIFIED")
+                        if time.monotonic_ns() >= input_quality.valid_until_ns:
+                            raise RuntimeError("ARM_INPUT_EXPIRED")
             if operation == "disarm":
                 self.request_stop("MANAGEMENT_" + operation.upper())
                 epoch = self.stop_epoch
@@ -601,16 +768,17 @@ class ManualSession:
             context, token = self.context()
             import math
 
-            response = self._call(
-                service,
-                ManageDevice.Request(
-                    context=context,
-                    token=token,
-                    axis_mask=3,
-                    linear_m=float(linear_mm) / 1000.0,
-                    rotation_rad=math.radians(float(rotation_deg)),
-                ),
+            request = ManageDevice.Request(
+                context=context,
+                token=token,
+                axis_mask=0 if self.control_profile == "servo" else 3,
+                linear_m=float(linear_mm) / 1000.0,
+                rotation_rad=math.radians(float(rotation_deg)),
             )
+            if input_quality is not None:
+                request.has_input_quality = True
+                request.input_quality = quality_to_ros(input_quality)
+            response = self._call(service, request)
             with self._lock:
                 self._merge_state_locked(response.state, authoritative=True)
                 c = self._credentials
@@ -645,6 +813,7 @@ class ManualSession:
         finally:
             with self._lock:
                 self._management_active = False
+                self._release_in_progress = False
             self._management_lock.release()
 
     def _ack_failed_arm_receipt(self):
@@ -679,14 +848,41 @@ class ManualSession:
                 return
             self._closing.wait(0.01)
 
+    def _wait_stop_confirmed(self, *, disarmed=False):
+        deadline = time.monotonic() + self.timeout_s
+        while not self._closing.is_set():
+            with self._lock:
+                self._confirm_stop_locked()
+                if (
+                    self._stop_settled_locked()
+                    and self._state is not None
+                    and self._state.stop.progress == "CONFIRMED"
+                    and (not disarmed or not self._state.armed)
+                    and time.monotonic_ns() - self._state_ns < 500_000_000
+                ):
+                    return
+            if time.monotonic() >= deadline:
+                raise TimeoutError("STOP_CONFIRMATION_TIMEOUT")
+            self._closing.wait(0.01)
+        raise RuntimeError("SESSION_CLOSING")
+
     def close(self):
         # Keep the executor alive while this bounded stop/release runs.
+        clean = True
         if self.identity()[0]:
             self.request_stop("OWNER_EXIT")
             try:
                 self.manage("release")
             except Exception as exc:
                 self.error = "RELEASE_FAILED:" + str(exc)[:160]
+                clean = False
+                self.notify(
+                    {
+                        "kind": "shutdown_error",
+                        "error": self.error,
+                        "monotonic_ns": time.monotonic_ns(),
+                    }
+                )
         self._closing.set()
         self._renew_timer.cancel()
         with self._lock:
@@ -695,6 +891,7 @@ class ManualSession:
             self._stop_latest = None
         for future in outstanding:
             self._abandon(future)
+        return clean
 
     def simulation_fault(self, name, enabled):
         if (

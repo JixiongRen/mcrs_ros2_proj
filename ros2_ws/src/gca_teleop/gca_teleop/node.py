@@ -17,7 +17,7 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from gca.observability.recorder import AsyncRecorder
 from gca_ros.conversion import quality_to_ros
-from gca_system_interfaces.msg import JogCommand, TeleopState
+from gca_system_interfaces.msg import JogCommand, ServoJogCommand, TeleopState
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -30,7 +30,8 @@ from .input.joydev import NativeJoydev
 from .input.scripted import ScriptedInput
 from .management import ManagementServer, default_socket
 from .model import InputHealth, Intent
-from .recording import FeedbackRecord, actions, mapped_record
+from .policy import TeleopPolicy
+from .recording import FeedbackRecord, ServoFeedbackRecord, intent_actions, mapped_record
 from .session import ManualSession
 from .state_machine import TeleopPipeline
 
@@ -45,6 +46,26 @@ class TeleopNode(Node):
         self.declare_parameter("script_file", "")
         self.declare_parameter("socket_path", str(default_socket()))
         self.declare_parameter("record_directory", "")
+        self.declare_parameter("control_profile", "dual_axis")
+        self.declare_parameter("servo_config_file", "")
+        control_profile = self.get_parameter("control_profile").value
+        servo_config_file = self.get_parameter("servo_config_file").value
+        self._servo_settings = None
+        if control_profile == "servo":
+            from gca.servo_config import load_servo_settings
+
+            self._servo_settings = load_servo_settings(servo_config_file)
+            self._policy = TeleopPolicy(
+                control_profile,
+                self._servo_settings.max_rpm,
+                self._servo_settings.manual_axis_to_servo_sign,
+                manual_input_mode=self._servo_settings.manual_input_mode,
+                manual_input_max_age_s=self._servo_settings.manual_input_max_age_s,
+            )
+        else:
+            if servo_config_file:
+                raise ValueError("SERVO_CONFIG_REQUIRES_SERVO_PROFILE")
+            self._policy = TeleopPolicy(control_profile)
         self.run_id = uuid.uuid4().hex
         self.profile = load_profile(self.get_parameter("profile_file").value)
         script = self.get_parameter("script_file").value
@@ -55,8 +76,8 @@ class TeleopNode(Node):
         self._closing = threading.Event()
         self._pipeline_lock = threading.RLock()
         self._management_lock = threading.Lock()
-        self._pipeline = TeleopPipeline(self.profile)
-        self._intent = Intent()
+        self._pipeline = TeleopPipeline(self.profile, policy=self._policy)
+        self._intent = Intent(control_policy=self._policy.control_policy)
         self._health = InputHealth(False, False, 0, "", "", "STARTING")
         self._last_frame = None
         self._input_commands = Queue(8)
@@ -67,21 +88,36 @@ class TeleopNode(Node):
         self._script_started_ns = 0
         records = self.get_parameter("record_directory").value
         self._recorder = AsyncRecorder(records) if records else None
-        self._feedback_record = FeedbackRecord()
-        self._session = ManualSession(self, notify=self._record)
+        self._feedback_record = ServoFeedbackRecord() if self._policy.is_servo else FeedbackRecord()
+        self._session = ManualSession(
+            self,
+            notify=self._record,
+            control_profile=control_profile,
+            servo_settings=self._servo_settings,
+        )
         qos = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE
         )
-        self._jog_pub = self.create_publisher(JogCommand, "/system/manual_target", qos)
+        self._jog_pub = self.create_publisher(
+            ServoJogCommand if self._policy.is_servo else JogCommand,
+            "/system/servo_manual_target" if self._policy.is_servo else "/system/manual_target",
+            qos,
+        )
         self._state_pub = self.create_publisher(TeleopState, "/teleop/state", qos)
         self._dispatcher = LatestDispatcher(
-            self._session, self._publish_jog, notify=self._record, failure=self._dispatch_failed
+            self._session,
+            self._publish_jog,
+            max_ttl_s=self._servo_settings.output_ttl_s if self._policy.is_servo else 0.15,
+            notify=self._record,
+            failure=self._dispatch_failed,
         )
         self._dispatch_group = MutuallyExclusiveCallbackGroup()
         self._observation_group = ReentrantCallbackGroup()
-        # Constant 250Hz scheduler allows profile changes without replacing a
-        # timer during callbacks. Actual dispatch follows the profile's bound.
-        self._timer = self.create_timer(0.004, self._tick, callback_group=self._dispatch_group)
+        # Held servo dispatch follows the actuator cadence. The independent
+        # input thread still processes every LT/B edge and requests STOP.
+        self._timer = self.create_timer(
+            self._dispatch_period_s(), self._tick, callback_group=self._dispatch_group
+        )
         self._state_timer = self.create_timer(
             0.1, self._publish_state, callback_group=self._observation_group
         )
@@ -96,6 +132,10 @@ class TeleopNode(Node):
                 "kind": "startup",
                 "profile": asdict(self.profile),
                 "profile_sha256": self.profile.fingerprint,
+                "control_policy": self._policy.control_policy,
+                "servo_config_sha256": self._servo_settings.sha256
+                if self._servo_settings
+                else None,
                 "physical_mapping": "NOT_RUN"
                 if self.profile.source == "scripted"
                 else "EVIDENCE_REQUIRED",
@@ -111,6 +151,11 @@ class TeleopNode(Node):
         if self.profile.source == "scripted":
             return ScriptedInput(self.profile, backend="simulation")
         return NativeJoydev(self.profile)
+
+    def _dispatch_period_s(self):
+        if self._policy.manual_hold_enabled:
+            return max(self._servo_settings.control_period_s, 1.0 / self.profile.dispatch_hz)
+        return 0.004
 
     def _input_loop(self):
         try:
@@ -155,10 +200,8 @@ class TeleopNode(Node):
                                 "frame": asdict(frame),
                                 "health": asdict(health),
                                 "intent": asdict(intent),
-                                "mapped": mapped_record(frame, self.profile),
-                                "requested_actions": actions(
-                                    intent.linear_mm_s, intent.rotation_deg_s
-                                ),
+                                "mapped": mapped_record(frame, self.profile, policy=self._policy),
+                                "requested_actions": intent_actions(intent),
                                 "monotonic_ns": time.monotonic_ns(),
                             }
                         )
@@ -230,7 +273,11 @@ class TeleopNode(Node):
                     with self._pipeline_lock:
                         self._pipeline = pipeline
                         self.profile = profile
-                        self._intent = Intent(reason="PROFILE_CHANGED")
+                        self._intent = Intent(
+                            reason="PROFILE_CHANGED", control_policy=self._policy.control_policy
+                        )
+                    if self._policy.manual_hold_enabled:
+                        self._timer.timer_period_ns = int(self._dispatch_period_s() * 1e9)
                     self._dispatcher.invalidate()
                     if self._reader is not None:
                         self._reader.close()
@@ -302,7 +349,9 @@ class TeleopNode(Node):
             # Initial idle/administrative gates cannot cancel every explicit
             # ARM. Physical B and active-motion failures always request STOP.
             if active or not benign:
-                self._session.request_stop(intent.reason)
+                receipt = self._session.request_stop(intent.reason)
+                with self._pipeline_lock:
+                    self._pipeline.bind_stop_epoch(receipt["stop_epoch"])
             self._dispatcher.invalidate()
             self._record(
                 {
@@ -325,9 +374,10 @@ class TeleopNode(Node):
             now = time.monotonic_ns()
             intent = self._pipeline.tick(self._health, now, **gate)
             self._accept_intent(intent)
-            if now < self._dispatch_after_ns:
-                return
-            self._dispatch_after_ns = now + int(1e9 / self.profile.dispatch_hz)
+            if not self._policy.manual_hold_enabled:
+                if now < self._dispatch_after_ns:
+                    return
+                self._dispatch_after_ns = now + int(1e9 / self.profile.dispatch_hz)
             if intent.action == "JOG":
                 if (
                     intent.quality.source_kind == "SCRIPT_SAMPLE"
@@ -345,13 +395,27 @@ class TeleopNode(Node):
         self._dispatcher.invalidate()
         with self._pipeline_lock:
             self._pipeline.reset(reason)
-            self._intent = Intent(reason=reason)
+            self._intent = Intent(reason=reason, control_policy=self._policy.control_policy)
         self._last_error = reason
 
     def _publish_jog(self, intent, context, token):
         remaining = (intent.quality.valid_until_ns - time.monotonic_ns()) / 1e9
         if remaining <= 0:
             raise ValueError("INPUT_EXPIRED_BEFORE_PUBLISH")
+        if intent.control_policy != self._policy.control_policy:
+            raise ValueError("INTENT_CONTROL_POLICY_MISMATCH")
+        if self._policy.is_servo:
+            self._jog_pub.publish(
+                ServoJogCommand(
+                    context=context,
+                    token=token,
+                    deadman=True,
+                    servo_angular_velocity_rad_s=intent.servo_rpm * 2.0 * math.pi / 60.0,
+                    ttl_s=min(self._servo_settings.output_ttl_s, remaining),
+                    quality=quality_to_ros(intent.quality),
+                )
+            )
+            return
         self._jog_pub.publish(
             JogCommand(
                 context=context,
@@ -385,6 +449,10 @@ class TeleopNode(Node):
             "script_started_ns": self._script_started_ns,
             "mode": profile.mode,
             "backend": self._session.backend,
+            "control_profile": self._policy.control_profile,
+            "manual_input_mode": self._policy.manual_input_mode,
+            "control_policy": self._policy.control_policy,
+            "servo_config_sha256": self._servo_settings.sha256 if self._servo_settings else None,
             "profile_id": profile.profile_id,
             "profile_sha256": profile.fingerprint,
             "intent": asdict(intent),
@@ -396,8 +464,15 @@ class TeleopNode(Node):
             "stop_confirmed": self._session.latest_stop_confirmed,
             "linear_valid": bool(state and state.linear_valid),
             "rotation_reference_valid": bool(state and state.rotation_reference_valid),
-            "position_mm": state.linear_position_m * 1000 if state else 0.0,
-            "rotation_estimated_deg": math.degrees(state.rotation_estimated_rad) if state else 0.0,
+            "position_mm": None
+            if self._policy.is_servo
+            else (state.linear_position_m * 1000 if state else 0.0),
+            "rotation_estimated_deg": None
+            if self._policy.is_servo
+            else (math.degrees(state.rotation_estimated_rad) if state else 0.0),
+            "servo": self._feedback_record.sample(state, self._session.backend)
+            if self._policy.is_servo
+            else None,
             "pending_count": self._dispatcher.pending_count,
             "inflight_count": self._dispatcher.inflight_count,
             "dropped_count": self._dispatcher.dropped_count,
@@ -452,12 +527,14 @@ class TeleopNode(Node):
             self._dispatcher.invalidate()
             with self._pipeline_lock:
                 self._pipeline.reset("OPERATOR_STOP")
-                self._intent = Intent(reason="OPERATOR_STOP")
+                self._intent = Intent(
+                    reason="OPERATOR_STOP", control_policy=self._policy.control_policy
+                )
         elif operation == "input-config":
             profile = load_profile(args["path"])
             # Evidence files load on the ordinary management worker. Only the
             # already prepared pipeline is exchanged under the input lock.
-            self._input_request("profile", (profile, TeleopPipeline(profile)))
+            self._input_request("profile", (profile, TeleopPipeline(profile, policy=self._policy)))
         elif operation == "script-start":
             self._input_request("start")
         elif operation == "script-stop":
@@ -467,19 +544,31 @@ class TeleopNode(Node):
         elif operation == "simulation-fault":
             self._session.simulation_fault(args["name"], args["enabled"])
         else:
+            arm_quality = None
+            if operation == "arm" and self._session.backend not in ("simulation", "hardware"):
+                raise ValueError("BACKEND_CAPABILITY_REQUIRED")
             if operation == "arm" and self._session.backend == "hardware":
                 with self._pipeline_lock:
-                    error = self._pipeline.hardware_arm_error(self._health, time.monotonic_ns())
-                if error:
-                    raise ValueError(error)
+                    now = time.monotonic_ns()
+                    if self._policy.is_servo:
+                        arm_quality = self._pipeline.hardware_arm_quality(self._health, now)
+                    else:
+                        error = self._pipeline.hardware_arm_error(self._health, now)
+                        if error:
+                            raise ValueError(error)
             self._dispatcher.invalidate()
             with self._pipeline_lock:
                 self._pipeline.reset("MANAGEMENT_" + operation.upper())
-                self._intent = Intent(reason="MANAGEMENT_" + operation.upper())
+                self._intent = Intent(
+                    reason="MANAGEMENT_" + operation.upper(),
+                    control_policy=self._policy.control_policy,
+                )
             linear, rotation = args.get("linear_mm", 0.0), args.get("rotation_deg", 0.0)
             finite(linear, "linear_mm")
             finite(rotation, "rotation_deg")
-            self._session.manage(operation, linear_mm=linear, rotation_deg=rotation)
+            self._session.manage(
+                operation, linear_mm=linear, rotation_deg=rotation, input_quality=arm_quality
+            )
         self._record(
             {"kind": "management", "operation": operation, "monotonic_ns": time.monotonic_ns()}
         )
@@ -501,6 +590,8 @@ class TeleopNode(Node):
             session_owned=bool(self._session.identity()[0]),
             armed=bool(state and state.armed),
             source_mode=self.profile.mode,
+            control_policy=intent.control_policy,
+            requested_servo_rad_s=intent.servo_rpm * 2.0 * math.pi / 60.0,
             requested_linear_m_s=float(intent.linear_mm_s) / 1000.0,
             requested_rotation_rad_s=math.radians(intent.rotation_deg_s),
             pending_count=self._dispatcher.pending_count,
@@ -520,6 +611,9 @@ class TeleopNode(Node):
             msg.applied_linear_m_s = state.applied_velocity_m_s
             msg.estimated_rotation_rad_s = state.estimated_rotation_velocity_rad_s
             msg.estimated_rotation_velocity_valid = state.rotation_estimate_valid
+            if self._policy.is_servo:
+                msg.measured_servo_rad_s = state.servo.measured_velocity_rad_s
+                msg.servo_valid = state.servo.valid
         self._state_pub.publish(msg)
         if self._recorder is not None:
             self._record(
@@ -527,7 +621,7 @@ class TeleopNode(Node):
                     "kind": "motion_sample",
                     "monotonic_ns": time.monotonic_ns(),
                     "intent": asdict(intent),
-                    "requested_actions": actions(intent.linear_mm_s, intent.rotation_deg_s),
+                    "requested_actions": intent_actions(intent),
                     "feedback": self._feedback_record.sample(state, self._session.backend),
                     "recorder": asdict(self._recorder.status()),
                 }
@@ -539,10 +633,10 @@ class TeleopNode(Node):
         self._dispatcher.invalidate()
         self._input_thread.join(1.0)
         server_clean = self._server.close()
-        self._session.close()
+        session_clean = self._session.close()
         self._timer.cancel()
         self._state_timer.cancel()
-        clean = server_clean and not self._input_thread.is_alive()
+        clean = server_clean and session_clean and not self._input_thread.is_alive()
         if self._recorder:
             clean = self._recorder.close(1.0) and clean
         return clean

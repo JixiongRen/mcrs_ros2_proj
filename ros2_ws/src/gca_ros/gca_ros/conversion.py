@@ -4,6 +4,7 @@ import math
 
 from gca.domain.manual import ManualInputQuality
 from gca.domain.models import CommandContext, JogCommand, MotionCommand, MotionLimits
+from gca.domain.servo import FeedRuntimeState, ServoJogCommand
 from gca_system_interfaces.msg import GcaState, StopStatus
 from gca_system_interfaces.msg import ManualInputQuality as QualityMessage
 
@@ -60,12 +61,27 @@ def jog_from_ros(msg):
     )
 
 
+def servo_jog_from_ros(msg):
+    return ServoJogCommand(
+        context=context_from_ros(msg.context),
+        velocity_rpm=msg.servo_angular_velocity_rad_s * 60.0 / (2.0 * math.pi),
+        freshness_token=msg.token,
+        ttl_s=msg.ttl_s,
+        deadman=msg.deadman,
+        quality=quality_from_ros(msg.quality) if msg.deadman else None,
+    )
+
+
 def stop_from_core(state):
     msg = StopStatus()
     msg.progress = state.stop_progress
     msg.reason = state.error_code or state.message
-    msg.linear_confirmed = state.stop_progress == "CONFIRMED"
-    msg.rotation_confirmed = state.stop_progress == "CONFIRMED" and state.engine_idle
+    servo_only = isinstance(state, FeedRuntimeState)
+    msg.linear_confirmed = not servo_only and state.stop_progress == "CONFIRMED"
+    msg.rotation_confirmed = (
+        not servo_only and state.stop_progress == "CONFIRMED" and state.engine_idle
+    )
+    msg.servo_confirmed = servo_only and state.stop_progress == "CONFIRMED"
     msg.evidence_kind = state.stop_evidence
     return msg
 
@@ -93,6 +109,31 @@ def state_from_core(state, stamp=None, requested_revision=""):
     ):
         setattr(msg, name, getattr(state, name))
     msg.mode = "GCA_ONLY"
+    msg.control_policy = "LEGACY_DUAL_AXIS"
+    if isinstance(state, FeedRuntimeState):
+        msg.mode = "SERVO_ONLY"
+        msg.control_policy = state.control_policy
+        for name in (
+            "raw_position_count",
+            "shaft_angle_rad",
+            "torque_enabled",
+            "hardware_error",
+            "sample_seq",
+            "sampled_ns",
+            "device_epoch",
+            "valid",
+            "configured",
+            "sample_age_s",
+            "error_code",
+            "watchdog_raw",
+        ):
+            setattr(msg.servo, name, getattr(state.servo, name))
+        for kind in ("measured", "requested", "accepted"):
+            setattr(
+                msg.servo,
+                f"{kind}_velocity_rad_s",
+                getattr(state.servo, f"{kind}_velocity_rpm") * 2.0 * math.pi / 60.0,
+            )
     msg.linear_position_m = state.position_mm / 1000.0
     msg.linear_velocity_m_s = state.velocity_mm_s / 1000.0
     msg.linear_valid = state.linear_valid

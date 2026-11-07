@@ -97,3 +97,5 @@ class Intent:
     lt_pressed: bool = False
     b_pressed: bool = False
     input_epoch: str = ""
+    control_policy: str = "LEGACY_DUAL_AXIS"
+    servo_rpm: float = 0.0

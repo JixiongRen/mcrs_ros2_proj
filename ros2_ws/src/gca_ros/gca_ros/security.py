@@ -34,6 +34,7 @@ class Grant:
     token: str
     deadline: float
     sequence: int
+    control_policy: str = "LEGACY_DUAL_AXIS"
 
 
 class LeaseAuthority:
@@ -69,9 +70,16 @@ class LeaseAuthority:
         sequence: int,
         duration_s: float,
         token: str = "",
+        control_policy: str = "LEGACY_DUAL_AXIS",
     ) -> Grant:
         if not secrets.compare_digest(key, self._key):
             raise AccessError("UNAUTHORIZED_COORDINATOR")
+        if control_policy not in (
+            "LEGACY_DUAL_AXIS",
+            "MANUAL_SERVO_VELOCITY",
+            "POSITION_EXTERNAL_ENCODER",
+        ):
+            raise AccessError("INVALID_CONTROL_POLICY")
         if not session_id or len(session_id) > 128 or generation < 1 or sequence < 1:
             raise AccessError("INVALID_CONTEXT")
         if not math.isfinite(duration_s) or duration_s <= 0 or duration_s > self._maximum:
@@ -84,6 +92,8 @@ class LeaseAuthority:
                 raise AccessError("SESSION_EXPIRED")
             if old.session_id != session_id or old.generation != generation:
                 raise AccessError("CONTROL_BUSY")
+            if old.control_policy != control_policy:
+                raise AccessError("CONTROL_POLICY_CHANGE_REQUIRES_RELEASE")
             if not token or not secrets.compare_digest(old.token, token):
                 raise AccessError("INVALID_TOKEN")
             if sequence <= old.sequence:
@@ -93,7 +103,9 @@ class LeaseAuthority:
             if token:
                 raise AccessError("STALE_TOKEN")
             issued = secrets.token_urlsafe(32)
-        self.grant = Grant(session_id, generation, issued, now + duration_s, sequence)
+        self.grant = Grant(
+            session_id, generation, issued, now + duration_s, sequence, control_policy
+        )
         return self.grant
 
     @synchronized

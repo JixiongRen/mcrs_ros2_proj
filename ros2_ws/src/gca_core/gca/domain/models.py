@@ -34,6 +34,9 @@ class Lease:
     sequence: int
     ttl_s: float = 1.0
     token: str = ""
+    # Pure-Python legacy callers retain their explicit existing dual-axis API.
+    # ROS execution-lease ingress must supply and authenticate this field.
+    control_policy: str = "LEGACY_DUAL_AXIS"
 
 
 @dataclass(frozen=True)

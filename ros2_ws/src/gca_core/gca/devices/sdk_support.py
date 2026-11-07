@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import socket
 from collections.abc import Callable
+from contextlib import nullcontext
 from importlib.metadata import version
 
 from .common import DeviceError
@@ -27,21 +28,63 @@ def dynamixel_factories(clock: Callable[[], int]):
 
     class DeadlinePort(sdk.PortHandler):
         deadline_ns = 0
+        write_guard = None
+
+        def setupPort(self, cflag_baud):
+            """Pinned SDK setup with POSIX exclusivity requested before open."""
+            import serial
+
+            if self.is_open:
+                self.closePort()
+            self.ser = serial.Serial(
+                port=self.port_name,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                timeout=0,
+                exclusive=True,
+            )
+            self.is_open = True
+            self.ser.reset_input_buffer()
+            self.tx_time_per_byte = (1000.0 / self.baudrate) * 10.0
+            return True
 
         def getCurrentTime(self):
             return clock() / 1_000_000
 
         def isPacketTimeout(self):
-            return clock() >= self.deadline_ns or super().isPacketTimeout()
+            # The caller already supplies the complete monotonic I/O budget.
+            # SDK latency estimates must not silently shorten that deadline.
+            return clock() >= self.deadline_ns
 
-        def writePort(self, packet):
+        def readPort(self, length):
             remaining = (self.deadline_ns - clock()) / 1e9
             if remaining <= 0:
-                raise DeviceError("DEVICE_TIMEOUT", "DYNAMIXEL write expired")
-            self.ser.write_timeout = remaining
-            return super().writePort(packet)
+                return b""
+            # Wait for bytes in the serial driver instead of spinning the
+            # SDK's nonblocking receive loop alongside the control threads.
+            self.ser.timeout = remaining
+            return super().readPort(length)
+
+        def writePort(self, packet):
+            # Only final authorization and transmission share the STOP fence;
+            # the SDK's subsequent receive wait must not block new inputs.
+            with (self.write_guard or nullcontext)():
+                remaining = (self.deadline_ns - clock()) / 1e9
+                if remaining <= 0:
+                    raise DeviceError("DEVICE_TIMEOUT", "DYNAMIXEL write expired")
+                self.ser.write_timeout = remaining
+                return super().writePort(packet)
 
     class CheckedPacketHandler(Protocol2PacketHandler):
+        def removeStuffing(self, packet):
+            # SDK rxPacket verifies the wire CRC before this normalization.
+            # Version 4.1.0 moves the CRC and updates LENGTH but leaves stale
+            # trailing list entries after removing stuffed bytes.
+            normalized = super().removeStuffing(packet)
+            length = normalized[5] | normalized[6] << 8
+            del normalized[7 + length :]
+            return normalized
+
         def txRxPacket(self, port, txpacket):
             device_id, instruction = txpacket[4], txpacket[7]
             if instruction == 2:
@@ -50,7 +93,13 @@ def dynamixel_factories(clock: Callable[[], int]):
                 expected = 3
             else:
                 expected = 0
-            received, result, error = super().txRxPacket(port, txpacket)
+            try:
+                received, result, error = super().txRxPacket(port, txpacket)
+            except Exception:
+                # Official SDK sets this before TX but has no exception cleanup.
+                # A revoked write must not leave the following STOP bus-busy.
+                port.is_using = False
+                raise
             if result == sdk.COMM_SUCCESS:
                 if (
                     received is None

@@ -16,6 +16,10 @@ setup(
     description="ROS host and CLI for supervised dual-axis motion",
     license="LicenseRef-Project-Unspecified",
     entry_points={
-        "console_scripts": ["gca_control_node = gca_ros.node:main", "gca_cli = gca_ros.cli:main"]
+        "console_scripts": [
+            "gca_control_node = gca_ros.node:main",
+            "servo_control_node = gca_ros.servo_node:main",
+            "gca_cli = gca_ros.cli:main",
+        ]
     },
 )
