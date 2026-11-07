@@ -2,9 +2,41 @@
 
 独立位移测量可用离线工具处理：`source tools/common.sh` 后执行 `"$GCA_PYTHON" tools/calibrate_from_measurements.py --input measurements.csv --output artifacts/calibration`。CSV列为 `count_start,count_end,measured_displacement_mm`，推进位移为正、退出为负，必须来自独立仪器而非目标值。工具拟合有符号比例、正反行程统计和残差，只写报告，不连接设备、不自动修改配置或verified。计数跨回绕时应先依据已核实规则整理连续计数；不能直接拿跨epoch的差值拟合。
 
-配置源码是 `gca/config.py` 的 `RuntimeConfig` 及 `gca/devices/common.py` 的三个设备配置类；正式设备装配在 `gca/devices/factory.py`。下表描述当前实际代码，不把设计草案中的未来字段视为已实现。
+原双轴配置源码是 `gca/config.py` 的 `RuntimeConfig` 及 `gca/devices/common.py` 的三个设备配置类；正式设备装配在 `gca/devices/factory.py`。仅舵机入口另使用下节的独立 Python 配置与 JSON 快照，不要求外部编码器或步进设备。
 
-当前默认配置是仿真模型。**硬件配置没有可直接运行的物理默认值**：`system_bringup/config/hardware.template.yaml` 中的null和false故意使configure/ARM失败。安装依赖、打开串口或手动翻转verified标志均不等于接线、标定或HIL通过。
+当前默认入口是仿真模型。**原双轴硬件模板没有可直接运行的物理默认值**：`system_bringup/config/hardware.template.yaml` 中的null和false故意使configure/ARM失败。安装依赖、打开串口或手动翻转verified标志均不等于接线、标定或HIL通过。
+
+## 仅舵机配置：独立脚本与快照
+
+人工编辑入口是 [`config/servo_settings.py`](../config/servo_settings.py)，严格类型与摘要校验在 `gca/servo_config.py`。导入、显示和导出只使用标准库，不访问设备或 ROS：
+
+```bash
+python3 config/servo_settings.py show --manual-input-mode joydev_hold
+python3 config/servo_settings.py export artifacts/servo_config/simulation.json \
+  --backend simulation --manual-input-mode joydev_hold
+python3 config/servo_settings.py export artifacts/servo_config/hardware.json \
+  --backend hardware --manual-input-mode joydev_hold
+```
+
+以上为实体手柄持续控制配置；省略 `--manual-input-mode` 时仍默认 `qualified_state`，要求匹配资格，合成输入模拟也使用这一默认策略。两种策略不通过修改实体标定文件相互冒充。
+
+快照含 schema、配置修订号、后端、设备参数及 SHA-256，不作为第二个手工配置来源。`servo_simulation.launch.py`／`servo_hardware.launch.py` 使用 `servo_config_file` 将同一文件同时交给设备、协调器和手柄；配置摘要与能力必须匹配。先 STOP 确认、DISARM、释放会话并退出节点，再修改数值、导出快照并重启整组节点重新 configure，无需编译 ROS 消息。设备的 cleanup/configure 不能替代手柄节点重载快照；文件路径参数不支持在线更换，原 `ApplyConfig` YAML 接口不接收此 JSON。
+
+| 配置组 | 当前值或语义 | 证据边界 |
+|---|---|---|
+| 身份 | by-id 路径、57600、ID 1、型号 1020 | 本轮只读识别通过；每次连接仍核对实际设备 |
+| 单位与方向 | 0.229 rpm/raw；`manual_axis_to_servo_sign=-1` | 上推反转的手柄约定，不是未来机构正位移标定 |
+| 最大速度 | `max_velocity_raw=349`，即 79.921 rpm | 软件指令上限80 rpm；型号标称空载46 rpm@12 V、57 rpm@14.8 V，不能据指令宣称实测达到80 rpm |
+| 加速度 | `max_acceleration_rpm_s=40.0`、`profile_acceleration_raw=12` | 当前空载联调参数，分别约束软件目标与设备响应，不代表已测得机械加速度边界 |
+| 周期与期限 | 控制 0.04 s、I/O整轮目标周期 0.02 s、单事务 0.08 s、反馈年龄 0.25 s、输出和held观察 0.30 s、停止确认 2 s | 各自用途不同；校验预算关系不等于测得最坏时延 |
+| 停止与总线保护 | `settle_s=0.10`、`velocity_tolerance_rpm=0.229`、`watchdog_raw=25` | LT/B 停车已有空载证据；两项专项失效测试后移，状态读取也能维持 watchdog |
+| 后续位移闭环 | `mechanical_mapping=null`、`position_pid=null` | 当前schema明确不接受已启用的位置控制配置 |
+
+历史[只读报告](../artifacts/servo_ros2/implementation-xce7i_e4/readonly/report.json)未写寄存器，实际读回模式 4、Goal Velocity 1023、watchdog 0，与候选快照不同是正常现象。当前真实入口configure会关闭力矩、按需切换模式1、读回限制并确认零目标。BFM映射模式已确认；本轮空载连续控制采用显式`joydev_hold`，无线资格仍未完成。
+
+v3快照修正了原150毫秒预算无法覆盖完整WRITE/ACK、READ及控制周期的问题。`joydev_hold`使用配置的300毫秒观察期限，既有样本及许可的截止时间不续期；LT/B独立STOP不等待该期限。原双轴profile与默认`qualified_state`的更严格输入约束保留。旧v2 JSON需重新导出，不接受不满足新预算校验的快照。
+
+纯舵机不使用下文双轴 `mm_per_revolution`、编码器比例、PID 或脉冲字段。未来每转推进量与机械方向均须独立实测；舵机轴角不能替代外部位移反馈。完整启动、只读工具和记录说明见[舵机指南](SERVO_USER_GUIDE.md)。下文继续描述原双轴 YAML 配置。
 
 ## 文件结构、加载与单位
 
@@ -158,7 +190,7 @@ plant的默认一阶时间常数、死区、饱和和每脉冲角度还定义在
 
 ## 真实舵机配置：devices.servo
 
-当前只支持经核实的 **XM430-W350、model_number=1020、固件≥38**。字段虽能描述其它数字，适配器仍会在写寄存器前拒绝不支持型号。物理连接、准确型号和HIL尚待确认。
+当前只支持经核实的 **XM430-W350、model_number=1020、固件≥38**。字段虽能描述其它数字，适配器仍会在写寄存器前拒绝不支持型号。本机型号和通信已有只读证据；机构比例、速度模式和原双轴 HIL 尚未因此通过。以下字段属于旧双轴毫米适配层。
 
 | 字段 | 单位/类型 | 允许值/当前行为 | 硬件默认策略 |
 |---|---|---|---|
@@ -174,7 +206,7 @@ plant的默认一阶时间常数、死区、饱和和每脉冲角度还定义在
 | transaction_timeout_s | s | >0；工厂若省略则使用显式runtime.io_timeout_s；模板要求填写 | null，待测 |
 | verified | bool | 必须true才允许open；必须关联确认记录 | false |
 
-构造器的少量技术默认不是硬件验收值。模式事务临时写watchdog=0清锁存错误仅发生在扭矩禁止时，随后核对非零运行值。速度配置还需满足：`60*max_linear_mm_s/(mm_per_revolution*velocity_unit_rpm)`不超过raw限制（考虑半单位量化）。
+构造器的少量技术默认不是硬件验收值。毫米适配层复用原生驱动，普通 configure 遇到 watchdog 锁存时拒绝，不再自动清锁；显式恢复要求力矩关闭且无硬件错误。速度配置还需满足：`60*max_linear_mm_s/(mm_per_revolution*velocity_unit_rpm)`不超过raw限制（考虑半单位量化）。
 
 ## 真实编码器配置：devices.encoder
 
@@ -223,6 +255,7 @@ plant的默认一阶时间常数、死区、饱和和每脉冲角度还定义在
 | 参数 | 默认/约束 | 作用 |
 |---|---|---|
 | config_file / configuration_file | 空字符串；前者优先 | 完整YAML路径，实际推荐launch的config_file |
+| servo_config_file | 仅舵机入口必填 | 独立脚本生成的 JSON；设备与手柄同路径、同摘要，变更后重启 |
 | coordinator_key | 启动时由launch共享的随机能力 | 设备管理授权，不写日志，不当作网络认证替代物 |
 | trusted_local_control | false | 需同时ROS_LOCALHOST_ONLY=1；仅受控本机硬件部署，须核实用户/设备权限 |
 | record_directory | 空字符串 | 记录输出目录；标准仿真launch会分配本次运行目录 |
@@ -235,7 +268,7 @@ plant的默认一阶时间常数、死区、饱和和每脉冲角度还定义在
 
 | 参数 | 默认/约束 | 作用 |
 |---|---|---|
-| profile | gca_only；其它值拒绝启动 | 明确本轮没有完整磁场实验执行器 |
+| profile | gca_only 或 servo | 分别为原双轴与仅舵机入口；均无磁场实验执行器 |
 | coordinator_key | 默认空值拒绝启动；由launch与设备节点共享随机值 | 领取设备执行许可所需的能力，不能写入记录或当作DDS身份认证 |
 | source_lease_max_s | 5.0 s；有限且≥0.1 s | 源控制会话的最大租约；每次申请仍须在0.1 s至该上限之间 |
 | executor_lease_s | 2.0 s；有限且0.1–5.0 s | 下游执行许可的单次期限，同时不得超过源会话剩余期限 |

@@ -1,6 +1,6 @@
 # ROS 2 接口与语义
 
-正式 IDL 位于 [`gca_system_interfaces`](../ros2_ws/src/gca_system_interfaces)。GCA-only 的公共动作入口是 `/system/execute_motion`，协调器代理 `/gca/execute_motion`。原系统设计的磁驱动联合实验 `/system/execute` 未在本轮实现，不接受“假磁驱动成功”。
+正式 IDL 位于 [`gca_system_interfaces`](../ros2_ws/src/gca_system_interfaces)。原双轴 GCA 的公共动作入口是 `/system/execute_motion`，协调器代理 `/gca/execute_motion`。仅舵机 profile 使用专用速度话题，当前拒绝位置 Action。原系统设计的磁驱动联合实验 `/system/execute` 未在本轮实现，不接受“假磁驱动成功”。
 
 ## 接口列表
 
@@ -13,6 +13,7 @@
 | `/system/get_motion_permit` | `ControlSession` service | 给一个命令上下文签发固定截止时间的一次性准入许可 |
 | `/system/execute_motion` | `ExecuteMotion` action | 单轴／双轴绝对或相对定位 |
 | `/system/manual_target` | `JogCommand` topic | MANUAL 模式的新鲜 deadman 速度输入 |
+| `/system/servo_manual_target` | `ServoJogCommand` topic | 仅舵机 profile 的 MANUAL 轴转速输入 |
 | `/system/{arm,disarm,reset_fault,request_stop,set_reference}` | `ManageDevice` service | 经会话授权的管理请求 |
 | `/system/apply_config` | `ApplyConfig` service | 完整配置候选，校验与实际应用分别报告 |
 | `/system/get_command_status` | `GetCommandStatus` service | 查询 command_id、拒绝原因及当前状态 |
@@ -20,6 +21,7 @@
 | `/system/state` | `GcaState` topic | 聚合设备快照 |
 | `/gca/execute_motion` | `ExecuteMotion` action | 协调器持设备许可调用，公共源token不能替代 |
 | `/gca/jog` | `JogCommand` topic | 协调器转发的有期限输入 |
+| `/gca/servo_jog` | `ServoJogCommand` topic | 仅舵机执行端接收的原生轴方向角速度 |
 | `/gca/execution_lease` | `ExecutionLease` service | 协调器专用：签发、续期、释放执行许可 |
 | `/gca/get_motion_permit` | `ControlSession` service | 设备端独立签发一次性准入许可 |
 | `/gca/{arm,disarm,reset_fault,request_stop,set_reference}` | `ManageDevice` service | 设备端再次授权与状态校验 |
@@ -31,6 +33,22 @@
 | `/gca_control_node/*` | 标准 Lifecycle／参数服务 | configure／activate／deactivate／cleanup，均不隐式ARM |
 
 接口类型可通过 `ros2 interface show gca_system_interfaces/action/ExecuteMotion` 查看。生命周期、设备管理与源会话是不同状态维度，不能只看 node active 就认为可以运动。
+
+## 仅舵机 profile
+
+新 launch 使用 `servo_control_node` 可执行入口，ROS 节点仍命名为 `/gca_control_node`。与原双轴执行端互斥，不能同时创建相同 `/gca/*` 服务。`configure/activate/claim/arm/stop/disarm/release` 仍由同一个 teleop owner 管理；本模式不调用毫米或步进参考。
+
+`ServoJogCommand` 包含 `context`、`token`、`deadman`、`servo_angular_velocity_rad_s`、`ttl_s` 和 `quality`。角速度表示舵机轴原生正方向，不是导管旋转速度或推进线速度。核心使用 RPM，边界按 `rad/s = rpm × 2π/60` 转换；原 `JogCommand` 的单位与含义保持不变。
+
+`ExecutionLease.control_policy` 明确区分 `LEGACY_DUAL_AXIS` 与 `MANUAL_SERVO_VELOCITY`，由协调器依据已认证会话绑定；执行端再次验证，续期不能改变策略。新 profile 的 MANUAL 会话只允许舵机速度控制，未来 `POSITION_EXTERNAL_ENCODER` 尚未启用。`ManageDevice` 增加 `has_input_quality` 和 `input_quality`，用于真实舵机 ARM 的输入复核：默认 `qualified_state` 要求真实资格；显式 `joydev_hold` 使用 `JOYDEV_HELD_ARM` 中立观察，仅允许零目标使能。缺失或不匹配当前配置的输入证据不能以普通管理请求绕过。
+
+`GcaState.servo` 是 `ServoState`：包含 `raw_position_count`、`shaft_angle_rad`、请求／接受／实测角速度、力矩、硬件错误、watchdog、配置状态、样本序号、设备代次、`sampled_ns`、年龄与有效性。`sampled_ns` 是本机读取完成的单调时刻，不是设备硬件采样时钟。`valid=false` 时数值不可当作测量。舵机轴角属于寄存器坐标，不证明真实推进距离；原外部位移和导管旋转有效标志保持 false。
+
+`StopStatus` 增加 `servo_confirmed`。`TeleopState` 增加 `control_policy`、`requested_servo_rad_s`、`measured_servo_rad_s` 和 `servo_valid`。停止确认仍依据当前停止事务的新鲜证据，不能凭一次写入回执或历史 retained 状态判定。
+
+`GetCapabilities` 增加 `control_profile`、`servo_config_sha256`、`can_servo_velocity`、`can_measure_servo` 和 `max_servo_velocity_rad_s`；手柄与设备核对同一配置快照。`can_linear_motion`、`can_rotation_motion` 和外部测量能力在纯舵机模式为 false。可用软件能力不代表硬件验收通过，`unverified_capabilities` 继续报告无线资格与舵机停止 HIL 等未验证项。
+
+本模式的 `/system/execute_motion`、`/gca/execute_motion` 明确拒绝尚未实现的外部编码器位置控制；不返回假成功。舵机快照不走原 YAML 在线更新，返回 `SERVO_SNAPSHOT_RECONFIGURE_REQUIRED`，需停止、DISARM 并 cleanup 后重新 configure；两端日常调参采用整组重启。具体步骤见[舵机指南](SERVO_USER_GUIDE.md)。后续章节的 mm/deg、位置 Action 与双轴参考说明针对原双轴 profile。
 
 ## 单位、身份与时效
 
@@ -100,6 +118,8 @@ NOT_ARMED、NOT_ACTIVE、CONTROL_BUSY 表示前置状态不满足；INVALID_TOKE
 |---|---|
 | EVENT_AGE | 真实GCA变化事件年龄；静态握持、右侧变化和心跳不能延期 |
 | QUALIFIED_STATE_CONTRACT | 资格记录匹配的reader观察；不是新无线报告或任意RF故障检测保证 |
+| JOYDEV_HELD_STATE | 仅显式 `joydev_hold` 舵机策略接受；依据reader观察期限，持续按住LT无单次时长上限，无线证据仍为UNKNOWN |
+| JOYDEV_HELD_ARM | 仅显式 `joydev_hold` 的零目标ARM中立证明，不能作为运动输入 |
 | SCRIPT_SAMPLE | 明确合成样本，仅simulation |
 | PROGRAMMED_JOG | 旧CLI jog(duration)的一次固定episode，后续帧不延长终点 |
 

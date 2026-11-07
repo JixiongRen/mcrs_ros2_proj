@@ -1,6 +1,6 @@
 # 实际软件架构
 
-一个 GCA 设备进程统一管理推进与旋转。ROS 2 提供正式命令、生命周期、状态和任务接口；本地闭环与设备截止时间独立于 DDS。这样，遥测仍在发布或 ROS executor 暂停，都不能给旧输出延长期限。
+设备执行层提供原双轴与仅舵机两种互斥入口，同一时刻只运行一个 `/gca/*` 执行端。ROS 2 提供正式命令、生命周期、状态和任务接口；本地控制与设备截止时间独立于 DDS。这样，遥测仍在发布或 ROS executor 暂停，都不能给旧输出延长期限。下图描述原双轴运行时；仅舵机路径见下节。
 
 ```mermaid
 flowchart TB
@@ -24,7 +24,19 @@ flowchart TB
 
 `gca_system_interfaces` 是独立 IDL 包。`gca_core` 安装唯一 Python 包 `gca`，领域、算法与 runtime 不导入 rclpy。真实硬件库只在 `devices` 内延迟导入。`gca_ros` 做 ROS 与领域对象转换，`system_coordinator` 管理上游会话并代理 GCA-only 动作，`system_bringup` 安装启动和配置资源。
 
-`legacy/` 只提供缺陷证据，不作为任何正式模块的导入来源。没有第二套 TCP 控制核心，也没有逐函数拆出的 PID／采样 ROS 节点。`/system/execute_motion` 明确只表示双轴动作；原系统设计中的 `/system/execute` 联合磁驱动实验仍属未来接口。
+`legacy/` 只提供缺陷证据，不作为任何正式模块的导入来源。没有第二套 TCP 控制核心，也没有逐函数拆出的 PID／采样 ROS 节点。原双轴入口的 `/system/execute_motion` 表示 GCA 单轴／双轴动作；仅舵机入口明确拒绝位置任务。原系统设计中的 `/system/execute` 联合磁驱动实验仍属未来接口。
+
+## 仅舵机路径
+
+`servo_simulation.launch.py` 与 `servo_hardware.launch.py` 启动 `servo_control_node`、`system_coordinator(profile=servo)` 和 `gca_teleop_node(control_profile=servo)`。设备节点名仍为 `gca_control_node`，复用生命周期、管理服务、授权与 STOP 机制；其纯 Python 核心是 `FeedAxisRuntime`，不创建外部编码器或脉冲设备。原双轴 `ControlRuntime` 和三设备装配保持独立。
+
+正式命令路径为 `LY/LT/B → TeleopPolicy → /system/servo_manual_target → coordinator → /gca/servo_jog → FeedAxisRuntime → DynamixelVelocityDrive`。映射后 LY 上正下负，在手柄策略转换一次为上负下正的 RPM；ROS 边界使用 rad/s。LX 不产生速度、不参与回中、不延长输入期限。现有毫米速度适配器包装共用原生驱动，未来机构比例与方向不进入当前手柄路径。
+
+`config/servo_settings.py` 是独立配置来源，导出严格 JSON 快照；设备与手柄读取同一快照并核对摘要。运行时只有一个舵机串口所有者，独立检查原命令截止时间。持续读状态不能延长输出期限，Bus Watchdog 也不能替代这一检查。STOP 撤销输出后，零速写入失败仍独立尝试关闭力矩；没有新鲜停止证据时报告 UNKNOWN。
+
+`MANUAL_SERVO_VELOCITY` 绑定已认证 MANUAL 会话。运行时复用 `runtime/authority.py` 的公共租约及上下文校验、质量追踪和 STOP 屏障；不会因收到位置消息或编码器上线切换策略。外部位移和导管旋转有效标志为 false；轴角度和速度只写入 `GcaState.servo`。`POSITION_EXTERNAL_ENCODER`、反馈端口、机械换算和位置控制接口已经预留，位置能力仍关闭。
+
+真实手柄输入策略由同一舵机快照选择：默认 `qualified_state` 要求有效无线资格；本轮按用户修订显式使用 `joydev_hold`，以持续有效的本地输入观察支持 LT 持续控制，不限制单次操作时长。后者保持无线证据 `UNKNOWN`，不冒充已取得资格。当前 BFM 模式的空载手柄正反转联调已完成；停止后重新释放与回中、新一次 LT、真实停车确认等条件仍保留。操作与证据见[舵机指南](SERVO_USER_GUIDE.md)。以下双轴手柄、轨迹、外部编码器 PID 和脉冲段说明仍针对原双轴入口。
 
 `gca_teleop` 已实现独立输入采集、映射/门控、单一 MANUAL 会话 owner、容量1异步派发和同用户本机管理代理。正式路径为 `joydev/ScriptedInput → TeleopPipeline → ManualSession/LatestDispatcher → /system/manual_target → coordinator → /gca/jog → ControlRuntime`；采集、状态和代理均不直接操作执行器。左杆 LY 推进、LX 旋转，LT 为双轴 deadman，B 软件 STOP；右侧磁场输入预留。实际操作见 [手柄指南](TELEOP_USER_GUIDE.md)，实现与测试定位见 [追踪表](TELEOP_TRACEABILITY.md)。
 

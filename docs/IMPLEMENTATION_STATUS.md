@@ -1,5 +1,156 @@
 # 工程实现状态与证据
 
+## 本轮交付结项（2026-11-07）
+
+用户已明确“两项专项移到后续，本轮结项”。依据这一范围修订，[交付报告](../artifacts/servo_ros2/delivery-v5/report.json)将本轮标为完成：软件实现PASS、授权空载范围内的真实手柄舵机联调PASS、外部编码器及位置PID接口预留PASS。接口预留通过不表示编码器已接入或位置闭环已经完成。
+
+最终参数为v5：指令上限79.921 rpm（不超过80 rpm）、变化率40 rpm/s、停车确认期限2秒；最近实测约±45.8 rpm。现行配置与最后一轮实机快照一致，87个安装源码及接口文件与工作区一致，最后的实机状态为零速、力矩关闭、DISARM和会话释放。结项核对复用已有测试及运行证据，没有追加测试，也未自动提交或推送。
+
+“停止命令更新但保持遥测”及“受控总线静默验证watchdog”两项实机测试移至后续，状态保留`NOT_RUN`。无线资格仍未完成，沿用用户明确允许的joydev_hold空载运行范围。上一轮偶发中断保留原始证据，本次未复现，不宣称根因已消除。逐项范围与证据见[需求核对](../artifacts/servo_ros2/delivery-v5/requirements.json)及[用户范围修订](../artifacts/servo_ros2/delivery-v5/scope-revision.json)。
+
+日常启用、正反转、B 后恢复和停止退出见[真实舵机快速操作](SERVO_USER_GUIDE.md#真实舵机快速操作)。以下按阶段保留历史记录，其中“尚未复测”“尚未验收”描述对应阶段，当前范围以本节结项说明为准。
+
+## 单次复现结果：本轮正常，前次记为未复现的偶发中断（2026-11-07）
+
+按用户“再测试一次，不能复现则判为意外中断”的要求，只增加了[一轮复现记录](../artifacts/servo_ros2/one-reproduction.8jkrvts9/report.json)，沿用v5参数及原16毫秒USB缓存设置。180秒记录窗口内，实测速度达到±45.8 rpm，记录了33次LT释放及3次B停止，没有串口错误、FAULT或进程意外退出。167次进程观察均保留舵机节点、协调器、手柄节点及launch存活证据，直到脚本开始显式清理。
+
+用户确认“这次看起来正常，最后脚本自动退出触发停车”。最后一次停车由预声明窗口结束触发，已确认零速、力矩关闭、DISARM、释放会话，launch退出码0。前次事件据此记为“本次未复现的偶发中断”，保留原故障和原始输入记录，不宣称根因已查明或长期可靠性已证明。本轮手柄复现测试结束，不追加重复试验。原goal中的停止命令更新但维持遥测、受控总线静默两项实机专项仍为NOT_RUN；无线资格继续按用户授权不作为joydev_hold运行的前置条件。
+
+## v5实机：快速重启及B恢复已有证据，反馈读取仍超时（2026-11-07）
+
+[本组报告](../artifacts/servo_ros2/stop-budget-retest.w3zafzp8/report.json)仍为FAIL。实测速度达到±45.57 rpm，初始化读回速度限制raw349、加速度raw12、watchdog25、模式1与Drive Mode0。原停车超时没有重现；约45 rpm下停车确认耗时约1.24–1.33秒。10段WAIT_STOP中，前9段恢复新的JOG并被核心接受，其中7段在下一次LT释放前测得再次运动；另2段很快又释放LT。运动中B停车后1.316秒确认，之后新操作也产生实测运动。
+
+最后一次LT释放后64.151毫秒出现`read_feedback / DEVICE_TIMEOUT / late DYNAMIXEL read`，错误记录时间比原80毫秒事务期限晚约0.885毫秒。此时已经重新按LT，但仍处于WAIT_STOP，尚未恢复运动；故障使本次重启取消。SDK返回成功、状态和长度校验通过，但没有原始字节接收完成时间，不能确定迟到来自串口传输、线程调度还是后续处理，不能据此忽略错误或随意延长期限。
+
+最后已确认零速、力矩关闭、会话释放，节点退出码0，DEVICE_TIMEOUT保留。本轮不再追加实机测试。用户随后明确为“持续按住LT时突然停转”。整组复审未发现原始LT保持按下却被误判为释放，也未发现无STOP而自行关闭力矩；但日志中的原始输入不能证明操作者实际松手。存在一次LY保持到底而LT上报释放约128.5毫秒后恢复的片段，性质未明，不能将最后的串口故障直接认定为操作者所述事件。无线资格和原计划两项失效停车场景继续标为NOT_RUN，整体真实链路尚未验收。
+
+## 80 rpm指令配置实测：停车确认期限不足（2026-11-07）
+
+[v4实机记录](../artifacts/servo_ros2/restart-retest.e_kxq19l/report.json)未通过。反向实测达到约45.57 rpm；首次LT释放后约14毫秒进入STOPPING，约105毫秒的新鲜反馈确认力矩关闭，但约1.19秒才首次读到零速。原1秒停车期限先触发`STOP_TIMEOUT`并DISARM，后续快速重启及B恢复未完成。无串口错误。最终确认零速、力矩关闭、释放会话，进程退出码0，故障原因保留。
+
+关闭力矩后轴位仍变化1101 counts（约96.77°），说明存在实际机械滑行，不能将全部间隔归为软件时延。v5只把`stop_timeout_s`改为2秒；STOP立即撤销输出、零速阈值、100毫秒驻留和原输入期限保持原样。对同一组真实样本进行[离线停车逻辑回放](../artifacts/servo_ros2/restart-retest.e_kxq19l/stop-replay.json)，旧配置在1.031秒进入FAULT，新配置在1.282秒确认停车；反馈缺失不能伪造停车的既有用例通过。2秒是本次约45 rpm观测后的候选确认预算，不会加快机械停车，也不代表实际80 rpm停车已验证。配置变更无需重建ROS包，须重新导出并重新配置；v5后续实机结果见本页顶部。
+
+## 最新实机反馈与快速重启修订（2026-11-07）
+
+[修订v3实机记录](../artifacts/servo_ros2/response-retest._hrdv9ie/report.json)已完成，操作者评价“基本正常”。记录中实测范围为−9.847至+9.847 rpm，正反方向接近满速的连续区间分别约36.65秒、29.04秒，未出现`JOG_EXPIRED`、串口错误或FAULT。LT/B均有停止事件；移动中的独立LT释放后，首次新鲜零速且力矩关闭反馈约0.49–0.59秒，确认约0.63–0.74秒。该时间是观测时间，不倒推精确机械停时。最后一次B与测试窗口结束STOP重叠，不作为独立B验收。最终已确认零速、关闭力矩、DISARM、释放会话，进程退出码0。
+
+尚有两项交互问题：B后重新操作及快速松开再按LT时，新按下事件可能发生在STOP确认前，被就绪变化重置而丢失；另有一次`CONTEXT_CHANGED`在新非零意图发出前截断操作。当时执行端仍在零速，但已有较新的硬件样本；teleop持有的旧样本恰好越过250毫秒门限，属于上层遥测缓存重复参与反馈新鲜度判断的强证据。该次实机不标为完整通过。
+
+按操作者新要求，v4配置将指令上限改为80 rpm（raw349，实际可表示值79.921 rpm），软件加速度40 rpm/s，固件Profile Acceleration raw12。厂家标称XM430-W350空载转速为12 V时46 rpm、14.8 V时57 rpm，因此80 rpm只表示软件指令上限，不是实机可达转速。原始实机记录仍对应10 rpm配置，不混入新参数结果。快速重启门控与本次参数调整完成后只进行相关定向检查及一次正式ROS模拟，实机验证另行记录。
+
+v4[修订与验证记录](../artifacts/servo_ros2/restart-response-fix/report.json)：101项相关定向检查通过，核心及手柄包重建成功，69个源码模块与安装副本一致。快速重启在最新STOP屏障内保留新LT操作资格，确认后使用当时的输入；B释放本身不恢复运动，等待期间释放LT、按B或输入失效均取消操作。原核心反馈期限及停车判据保留。
+
+正式模拟发现满速RPM经ROS单位往返转换后出现浮点尾差，已限制为四个ULP的舍入容差并在接纳时夹回精确上限，真实超限仍拒绝。第二次运行在初始化RPC超时，未进入运动，具体底层时序原因没有被记录；检查工具补充了生命周期服务实际只读响应的启动条件。[最终安装后10秒模拟](../artifacts/servo_ros2/restart-response-fix/ros-simulation-ready/report.json)十项检查通过，节点退出码0；两次失败记录保留。该模拟使用合成输入，实体held快速重启由软件用例覆盖，不能代替实机结果。**本轮软件验证结束；80 rpm指令配置、40 rpm/s加速度及快速重启修订尚未实机验收。**
+
+## 历史实机：响应迟缓与指令到期（2026-11-07）
+
+[本次实机报告](../artifacts/servo_ros2/permit-retest.np0hati9/report.json)为FAIL。已记录正负9.847 rpm，但操作者反馈不跟手并再次中断；首发停止原因为`JOG_EXPIRED`，未记录到串口错误。停止前输入观察仍更新，LT保持、B未按；seq683从申请许可到发布耗时48.353毫秒，随后36.483毫秒才首次反映在设备状态中，此时原输入期限仅剩38.755毫秒。seq685虽在旧期限前30.505毫秒发布，却未及时成为执行端新指令。现有记录缺少下游各阶段接收及拒绝信息，尚不能确定该条指令的具体延迟位置。
+
+响应迟缓另有明确原因：原软件加速度为3 rpm/s，固件加速度raw 1约为3.576 rpm/s。记录中目标已变为+9.847 rpm时，受限输出仍接近零，随后约3.364秒才达到目标。末次反馈确认零速、力矩关闭，DISARM、会话释放及launch正常退出；持续运行和独立LT/B验收未完成。
+
+本次软件修订集中在四处：软件加速度改为20 rpm/s、固件raw 6；舵机输入及输出期限统一为300毫秒，移除手柄发送端硬编码150毫秒；I/O按整轮耗时计算等待，不在写入及读取后再固定等待20毫秒；补充JOG各阶段拒绝原因和核心拒绝返回日志。原始样本及许可一经生成便不续期，LT/B独立STOP、单一在途许可及最新命令槽保留。默认qualified_state和旧双轴输入约束保留。
+
+300毫秒按现有两个80毫秒事务及控制调度预留预算，不是实测最坏延迟或机械停车承诺。旧150毫秒快照不能满足新的完整读写周期校验，必须重新导出v3配置。[94项定向检查](../artifacts/servo_ros2/response-budget-fix/report.json)通过（核心50项、手柄与ROS边界44项），四包重建成功，69个源码模块与安装副本一致。[安装后10秒ROS模拟](../artifacts/servo_ros2/response-budget-fix/ros-simulation/report.json)十项检查通过，节点正常退出；模拟使用合成输入，连续held语义由定向用例覆盖。第一次边界测试因测试模块导入路径缺失而未能收集，修正环境后通过，原失败记录保留。软件验证结束，**修订后实机尚未复测，不能宣称已消除运动中断**。
+
+## 上一组实机：持续反转时指令到期（2026-11-07）
+
+通信锁补丁后的[实机复测](../artifacts/servo_ros2/joystick-retest.namyiyr5/report.json)仍未通过。执行约15.88秒后出现`JOG_EXPIRED`；此时LY仍为上推到底、LT按住、B松开，输入继续更新。本组没有记录到串口错误，实测范围为−9.847至0 rpm。最终已确认零速、力矩关闭、DISARM和会话释放，全部实机进程正常退出；LT/B与持续正反转未完成实机验收。
+
+软件复现确认，协调器与执行端的运动许可服务原先与管理操作共用互斥回调组，管理等待会阻塞许可。已将两端许可服务改为独立回调组，保留现有权限、单次许可、截止时间与STOP屏障。[两个原版复现用例](../artifacts/servo_ros2/joystick-retest.namyiyr5/permit-reproducer.xml)均因等待管理回调而失败；分组修改后的31项相关回归通过。[一次35秒ROS模拟](../artifacts/servo_ros2/joystick-retest.namyiyr5/permit-sustained-simulation/report.json)在3至31.8秒区间的288个状态均为EXECUTING，并确认LT释放后归零。该模拟使用合成输入和模拟舵机，不代表实体手柄链路通过，也未覆盖随后补充的鉴权／许可登记原子性修改。
+
+并发复审补齐了鉴权与许可登记的原子性：使用现有授权锁保护这两个短操作，防止撤销完成后重新残留旧代次许可；锁内没有设备操作或RPC等待。最终[33项定向回归](../artifacts/servo_ros2/joystick-retest.namyiyr5/permit-atomic-tests.xml)通过，两包重建成功且源码与安装副本一致。最终安装版本的[10秒正式ROS模拟](../artifacts/servo_ros2/joystick-retest.namyiyr5/permit-final-simulation/report.json)十项检查通过，包括正反转、调速及LT/B；节点正常退出。该阶段软件验证完成；随后实机仍失败，见本页最新记录，整体真实链路未验收。
+
+## 上一组实机：正反转已实现，速度写入超时（2026-11-07）
+
+[本组记录](../artifacts/servo_ros2/joystick-hardware.hqasexp2/report.json)显示，实测速度达到−9.847至+9.847 rpm，759条JOG请求持续约30.32秒；随后出现`write_velocity / DEVICE_TIMEOUT / late DYNAMIXEL write`。故障前LT仍按住、B未按下，输入持续更新。最终零速、力矩关闭、停止确认，实机与采集进程已退出；LT释放和B停车未能独立验收，本组不通过。
+
+速度写入完成时已超过80毫秒绝对期限。设备状态记录存在约232毫秒间断，但写事务持有控制线程也需要的锁，因此不能仅凭间断判定整个进程暂停。一次35秒纯软件时序采集未复现同量级的舵机进程GC停顿；该模拟约6.5秒便出现JOG_EXPIRED，不是连续运动验收。现有证据尚不能区分本次串口／USB响应延迟与线程调度停顿，不放宽期限或忽略错误。
+
+另外修复已确认的记录缺陷：待处理、执行中及已确认的故障原因不再被后续普通STOP覆盖。未新增状态字段，也未改变停车时序；[15项相关回归](../artifacts/servo_ros2/joystick-hardware.hqasexp2/fault-reason-tests.xml)通过。此修复用于保留故障依据，**不代表意外停车根因已解决**。
+
+随后修复速度事务对控制更新的阻塞：STOP锁只覆盖最终许可检查与串口发送，等待ACK时释放锁，允许控制线程接纳新输入或撤销输出。发送前取消会释放SDK的总线占用标志，后续零速／关闭力矩仍可执行；迟到回执不能恢复已撤销输出。原有80毫秒事务期限、输入／租约／输出截止时间和报文校验保持不变。[69项定向回归](../artifacts/servo_ros2/joystick-hardware.hqasexp2/write-guard-tests.xml)通过，核心包构建成功，5个运行文件与安装副本一致，见[修复记录](../artifacts/servo_ros2/joystick-hardware.hqasexp2/write-guard-repair.json)。本补丁尚未开展实机运动复测，不能将软件回归通过视为持续转动已经通过。
+
+安装后的一次[10秒ROS模拟](../artifacts/servo_ros2/joystick-hardware.hqasexp2/write-guard-ros-simulation/report.json)十项检查通过，涵盖正反转、杆量调速、LT/B及停止后不恢复，所有节点正常退出。本轮软件验证至此结束；该短模拟不替代持续实机验收，也不消除上文35秒时序采集中的未解决间断。
+
+## 再次复测：运动前反馈读取故障（2026-11-07）
+
+[补丁后的实机记录](../artifacts/servo_ros2/hardware-retest.1nsxzeft/after-budget-fix/report.json)表明，本次在READY约10.4秒后、手柄操作之前发生`read_feedback / SDK_ERROR -3002`，没有发布任何JOG；故障发生时没有运动输入期限。故而不能继续将本次不转动归因于旧运动指令的剩余时长。
+
+审查确认SDK还有独立的提前超时：57600波特下，72字节反馈的SDK估计等待约48.41毫秒，短于项目配置的80毫秒。软件回归复现55毫秒到达的完整合法响应被提前拒绝。已将接收超时统一为调用者原有绝对期限，并将零超时忙轮询改为按剩余期限等待串口数据；不重发运动、不延长旧输出有效期，CRC、长度及身份检查保留。
+
+独立于ROS的30秒只读采集取得625个轴反馈样本、共629笔READ，全部成功，最长31.81毫秒，见[报文记录](../artifacts/servo_ros2/hardware-retest.1nsxzeft/after-budget-fix/wire-readonly.json)。这不证明原始ROS故障报文一定有效；未捕获当时线缆数据，真实报文损坏仍不能排除。[38项适配层回归](../artifacts/servo_ros2/hardware-retest.1nsxzeft/after-budget-fix/sdk-tests.xml)通过，覆盖期限、完整合法帧、错误CRC及缺失尾部。
+
+核心包已重建，源码与安装内容一致。修复后的[ROS实机反馈检查](../artifacts/servo_ros2/hardware-retest.1nsxzeft/after-budget-fix/sdk-idle-check-2/report.json)持续30秒，新增615个样本，无串口故障，全程零速、力矩关闭，launch正常退出。首次检查脚本在协调器状态尚未到达时申请会话而提前结束，其记录保留；正式反馈检查等待配置状态就绪，并未申请会话或ARM。
+
+**当前结论：SDK修复、定向回归和实机反馈读取通过；手柄持续运动仍未验收。** 本次全部实机进程已关闭。以下为之前阶段证据。
+
+## 实机复测：短暂低速后串口超时（2026-11-07）
+
+本次实机复测未通过，操作者反馈“仍未观察到任何转动”。[原始记录与报告](../artifacts/servo_ros2/hardware-retest.1nsxzeft/report.json)显示：LY、LT均收到完整范围输入；发出了19条速度请求，最大反向请求为−9.847 rpm。舵机短暂接受到−1.603 rpm，反馈峰值为−1.374 rpm，轴位置净变化约−4.48°；进入EXECUTING约0.66秒后报`SDK_ERROR -3001`，随后的正向操作因FAULT而未执行。这不构成持续运动通过。
+
+错误时间只比执行端旧输入期限晚0.124毫秒；更新的手柄指令已发布，但串口写回执等待仍持有控制锁。写入启动时旧输出剩余约24毫秒，低于既往约28毫秒的正常通信时间，存在本地期限截断交易的缺陷。当前没有逐字节串口记录，不能排除底层通信故障。已修复：写速度前必须剩余完整的既有80毫秒事务预算，不足则跳过旧输出；反馈读取使用独立预算；错误记录补充具体通信阶段和期限。未放宽任何旧指令期限，未新增配置或状态机。新增两个28毫秒读写时序场景，覆盖旧输出跳过、新输入执行及STOP／断供停车；[39项定向回归](../artifacts/servo_ros2/hardware-retest.1nsxzeft/repair-tests.xml)、核心包重建与安装一致性核对通过。此次补丁尚未实机验收。
+
+本次已执行STOP、DISARM和释放会话；新反馈确认零速、力矩关闭，launch退出码为0，采集进程也已关闭。以下73项软件测试和ROS模拟属于复测前版本，不能据此宣称实机问题已解决。
+
+## 上一轮代码修复：使能时序与输入调度（2026-11-07）
+
+按用户要求，先完成多agent定位、代码修复和有限软件验证，实机进程已经关闭。本轮沿用现有状态机、授权链路和单一串口所有者，修改集中在锁范围、期限传递、响应解析与重复计算。
+
+| 问题与依据 | 修复 |
+|---|---|
+| 停车后重新使能时，串口握手持有控制锁；日志中的后续指令2239、2241、2242已更新期限，但执行端仍使用首条期限，最终报SDK超时 | 耗时的零目标握手移到锁外，使用固定事务预算；最终使能前后检查当前已接纳输入、命令期限和STOP/会话身份。每条非零输出原有期限保持不变 |
+| 初次ARM握手中接纳首条JOG会正常推进输出代次，却被使能检查误判撤销 | 删除使能阶段重复的输出代次约束，运动写出仍检查输出代次；增加并发回归 |
+| SDK解填充后更新报文长度，但保留Python列表残尾，合法响应可能被本地长度检查误拒 | 在官方SDK完成CRC校验及解填充后裁去残尾；错误CRC和缺少数据的响应继续拒绝。软件缺陷已复现，既往实机每一条损坏响应的线缆报文未留存 |
+| 手柄节点以250Hz重复检查，而默认舵机控制为25Hz；实际曾记录108.3ms读取停顿 | `joydev_hold`调度使用舵机控制周期与profile频率上限，去除重复节流和重复身份检查；输入线程仍独立读取并直接处理LT/B停车。该次读取停顿的直接原因尚未单独确认，不能仅凭负载推定 |
+| 输入有效期在手柄层另有硬编码，零目标ARM还要求额外按键事件 | 通过既有舵机快照传递`manual_input_max_age_s`，同时服从输入profile更短的期限；完整中立INIT可用于零目标ARM，实际运动仍要求新的物理LT上升沿 |
+
+[73项定向测试](../artifacts/servo_ros2/software-repair.1724qbqc/pytest.xml)、[核心与手柄包构建](../artifacts/servo_ros2/software-repair.1724qbqc/build.log)及[正式ROS模拟的10项检查](../artifacts/servo_ros2/software-repair.1724qbqc/ros-simulation/report.json)通过；72个源码模块与安装内容一致。模拟使用合成输入验证共用节点链路，`joydev_hold`的保持、期限和并发行为由定向测试覆盖。验证完成后停止追加，见[本轮报告](../artifacts/servo_ros2/software-repair.1724qbqc/report.json)。
+
+**该阶段结论：软件修复与模拟验证通过；随后实机复测未通过，见上节。** 此前真实操作确有中断和不转动，保留失败记录；attempt5仅启动节点，未配置或使能设备便结束，不算运动验证。无线资格仍未完成。以下为此前各阶段记录，不覆盖最新源码。
+
+## 本轮修订：LT持续操作、速度上限10 rpm
+
+2026-11-07用户明确要求LT按住时持续操作，不设单次操作时间上限，LY决定方向与速度。代码已通过舵机配置快照的显式 `manual_input_mode=joydev_hold` 实现该语义；单一配置源 `config/servo_settings.py` 设置raw 43，即9.847 rpm，低于10 rpm，变化率3 rpm/s。持续有效reader观察允许静态杆量保持，0.15 s只约束reader观察与输出的新鲜度；会话、命令、输出期限和LT/B停止仍生效。
+
+无线链路证据仍为 `UNKNOWN`，无线资格仍为 `NOT_RUN`；用户已取消其作为本轮空载持续操作的前置条件。默认 `qualified_state` 保留原资格约束，只有显式导出 `joydev_hold` 快照才采用新策略。舵机节点、协调器和手柄节点加载同一快照；管理顺序为configure、activate、claim、arm，不设置外部 `reference`。
+
+| 本轮项目 | 当前实际结果 |
+|---|---|
+| 定向回归 | [67项JUnit](../artifacts/servo_ros2/bounded-jog-tx1awiz0/held-tests.xml)全部通过，0失败/错误/跳过，14.399s |
+| 静态检查与构建 | 17个相关Python文件Ruff检查通过；[五包普通构建](../artifacts/servo_ros2/bounded-jog-tx1awiz0/held-build.log)通过，34.3s |
+| 故障修复回归 | ARM重复事务移除后[32项回归](../artifacts/servo_ros2/bounded-jog-tx1awiz0/arm-fix-tests.xml)通过；SDK字节填充响应长度修复后[34项回归](../artifacts/servo_ros2/bounded-jog-tx1awiz0/packet-fix-tests.xml)通过，分别重建核心包；用例与初轮有重叠 |
+| 真实速度控制 | 已读回速度模式1、raw 43限幅和watchdog 25，已观察到正反转；操作中出现JOG_EXPIRED及SDK_ERROR中断，随后一轮未转动。实机流程已结束；最新软件修复见上节，见[阶段报告](../artifacts/servo_ros2/bounded-jog-tx1awiz0/held-report.json) |
+| 范围与记录 | [scope.json](../artifacts/servo_ros2/bounded-jog-tx1awiz0/scope.json)保存用户修订及已取代的旧范围；目录名 `bounded-jog-tx1awiz0` 沿用历史名称，不代表当前存在单次时长上限 |
+
+本轮只验证新输入语义及受影响接口，没有重跑历史完整工程验收。下文259/63/13项舵机测试、491/436项及更早455项完整结果均属于此前源码快照，不能作为本次修改的验收结果。实际操作见[舵机指南](SERVO_USER_GUIDE.md)。
+
+## 上一版：仅舵机 ROS 2 软件通过，真实链路尚未验收
+
+2026-11-06依据[舵机接入方案](SERVO_ROS2_INTEGRATION_PLAN.md)与[实施任务](SERVO_ROS2_IMPLEMENTATION_GOAL_PROMPT.md)，已写入独立标准库配置脚本、原生 RPM 驱动、仅舵机 `FeedAxisRuntime`、正式 ROS 速度／状态接口、同 owner 管理和手柄策略。LY 上推反转、下推正转，幅度调速，LT/B 保留停止门控；LX 未分配。当前手柄模式不创建或使用外部位移编码器，未来机械标定、反馈端口与位置 PID 仅预留契约，位置任务明确拒绝。
+
+该版记录独立保存于 [`artifacts/servo_ros2/implementation-xce7i_e4/`](../artifacts/servo_ros2/implementation-xce7i_e4/)。下列通过项及资格门控陈述均对应更改前版本，不覆盖当前 `joydev_hold`；各项不累加为完整工程或真实运动验收：
+
+| 项目 | 当前结果与证据 |
+|---|---|
+| 受影响包构建 | 六包构建通过，见[构建日志](../artifacts/servo_ros2/implementation-xce7i_e4/build.log)；后续手柄修复另有定向重建 |
+| 首轮定向测试与旧路径回归 | 259 项通过，见[软件报告](../artifacts/servo_ros2/implementation-xce7i_e4/software/report.json)及[JUnit](../artifacts/servo_ros2/implementation-xce7i_e4/software/pytest.xml)；覆盖当时源码，不代替后续修复复核 |
+| 手柄 STOP／release 修复复核 | 四个受影响文件共 63 项通过，见[复核报告](../artifacts/servo_ros2/implementation-xce7i_e4/stop-release-recheck/report.json)；该报告中的后续模拟尝试未通过，最终链路结果见下一行 |
+| 最终 STOP 回执与正式 ROS 模拟 | PASS；[最终复核报告](../artifacts/servo_ros2/implementation-xce7i_e4/stop-receipt-recheck/report.json)中 core 重建、13 项定向回归及 ROS 模拟退出码均为 0。[模拟报告](../artifacts/servo_ros2/implementation-xce7i_e4/ros-simulation-pass/report.json)十项检查全部通过，`hardware_tested=false`、`launch_exit_code=0`，三个子节点正常退出 |
+| 最终源码／安装与静态检查 | [安装文件核对](../artifacts/servo_ros2/implementation-xce7i_e4/installed_sources_final.json)记录 73 项源码与安装内容一致；[静态结果](../artifacts/servo_ros2/implementation-xce7i_e4/static-final.json)的 40 个 Python 文件检查和格式检查均通过 |
+| 新驱动真实只读识别 | PASS；一次探测取得三个新样本，见[只读报告](../artifacts/servo_ros2/implementation-xce7i_e4/readonly/report.json)。型号 1020、固件 46、模式 4，0 rpm、力矩关闭、硬件错误 0；单次轴反馈 READ 约 28–32 ms，WRITE 次数为 0 |
+| 接收器模式确认 | PASS；2026-11-07 完成 BFM → PC360 → BFM 两次现场切换，见[模式确认记录](../artifacts/servo_ros2/implementation-xce7i_e4/input-mode-confirm-ugna0rh2/assessment.json)。当前为 BFM，`20bc:506d / hid-generic`；PC360 实测为 `045e:028e / xpad` |
+| 模式与映射关联 | PASS；新增 schema 3 来源包装，保留原标定原文并验证 BFM→PC360→BFM 观察。已生成无无线资格的 `event_age` profile，[安装后加载检查](../artifacts/servo_ros2/implementation-xce7i_e4/input-mode-confirm-ugna0rh2/installed-binding-check.json)通过，当时资格模式的真实ARM仍拒绝 |
+| 实体手柄资格 | NOT_RUN；当前模式已确认，但手柄断电、无线失联、接收器拔出各三次的资格检查尚未执行。长按 Back＋B 关机不提供准确的断电起点，不能用 B STOP 代替无线失联响应 |
+| 真实速度模式 1 与停止验收 | NOT_RUN；未进行模式切换、真实 ROS 调速、无线失联停车或本轮运动 HIL；原双轴 H01–H03 状态不变 |
+
+首轮 259 项、STOP／release 修复 63 项、零速回执修复 13 项存在重叠，不能相加。最终模拟确认上推负转速、下推正转速、不同幅度、速度限制、LT/B 停止、B 后不恢复以及外部测量不可用。结束时 `session_owned=false`、`armed=false`、`stop_confirmed=true`、`stop_progress=CONFIRMED`，记录器 dropped/errors 均为 0。以上是在正式安装后的 ROS 节点与模拟舵机上取得的证据。
+
+初期检查工具的启动等待时序、持续 B／脚本结束与 release 的 STOP 竞争、零速回执与输出代次更新的竞争均已修复。后者曾使状态中的接受 RPM 未清零，但当时力矩已关闭、反馈归零，不能误述为真实恢复运动。历史失败保留在 [ros-simulation](../artifacts/servo_ros2/implementation-xce7i_e4/ros-simulation/report.json)、[ros-simulation-recheck](../artifacts/servo_ros2/implementation-xce7i_e4/ros-simulation-recheck/report.json)、[stop-release-recheck](../artifacts/servo_ros2/implementation-xce7i_e4/stop-release-recheck/report.json)、`ros-simulation-complete/` 和 `ros-simulation-verified/`，最终通过未放宽验收条件。该版软件验证已结束；当前只针对上述用户修订执行必要验证，不重新启动历史完整验收。
+
+分项交付结论：**软件实现 PASS；后续接口 PASS，仅限已定义契约、关闭能力并拒绝位置任务；真实输入资格 NOT_RUN；真实速度模式 1 与相关 HIL NOT_RUN。** 后续接口通过不表示编码器驱动、真实位移闭环或 PID 整定完成。
+
+只读时实际 Goal Velocity 仍为 raw 1023、watchdog 为 0；工具没有修改它们。当时的候选速度上限4.58 rpm及配置时限不是实测安全边界，历史位置模式约 10°／720° 试转也不替代本轮速度模式证据。整体真实链路尚未完成；操作命令、配置重载、记录含义与停止退出见[舵机指南](SERVO_USER_GUIDE.md)。
+
 ## 新增功能：ROS 2 手柄动作与偏移文本记录
 
 2026-11-06按用户明确的新功能要求，扩展 `record_directory`：输入事件记录原始杆量、中心偏移、曲线前后归一化值、映射动作与门控后的速度请求；10 Hz 记录系统反馈及相对有效基线的推进位移、旋转估计角变化。参考变化或反馈失效不会沿用旧基线，旋转估计不标为实测角度。操作及 `.txt` 转换见[手柄记录指南](TELEOP_USER_GUIDE.md#将输入动作与模拟偏移写入文本文件)。

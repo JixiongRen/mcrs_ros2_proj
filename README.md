@@ -4,7 +4,7 @@
 
 正式入口是 ROS 2：客户端 → `system_coordinator` → `gca_control_node` → 本地控制与设备 I/O。当前交付范围为 **GCA-only**。Windows 磁驱动与联合实验编排保留设计边界，没有用 GCA 动作替代磁场／电流控制。
 
-本轮无硬件工程交付已完成：200项软件测试全部通过，五包独立普通安装及完整ROS仿真通过。逐项证据和已观测的调度限制见 [工程状态与证据](docs/IMPLEMENTATION_STATUS.md)。实机身份、电气接口、波形和停止性能仍按 H01–H03 独立验收，当前均为NOT_RUN。
+原双轴路径已完成软件模拟验证；新增仅舵机路径已完成空载手柄实机联调，可直接按[真实舵机快速操作](docs/SERVO_USER_GUIDE.md#真实舵机快速操作)使用。手动舵机调速不依赖外部编码器；真实位移闭环、双轴 H01–H03、无线资格及两项后移专项测试尚未完成。各阶段证据见[工程状态与证据](docs/IMPLEMENTATION_STATUS.md)。
 
 ## 无硬件快速运行
 
@@ -36,15 +36,19 @@ gca_source_install
 
 ## 手柄控制
 
+**真实舵机：**使用 [`servo_hardware.launch.py`](ros2_ws/src/system_bringup/launch/servo_hardware.launch.py)，显式配置为 `joydev_hold`。按住 LT，左杆上推反转、下推正转，幅度越大速度越快；松开 LT 或按 B 停车。持续操作没有单次时长上限，指令上限为 80 rpm、加速度为 40 rpm/s，最近实测约 ±45.8 rpm。完整启动、B 后恢复、快速再次操作、停止和记录步骤见[舵机用户指南](docs/SERVO_USER_GUIDE.md#真实舵机快速操作)，此入口不执行 `reference`。
+
+**独立查看输入：**
+
 先在项目根目录运行独立输入监视器，直接观察实体手柄数据；此步骤无需 ROS 2，不驱动执行器：
 
 ```bash
 python3 tools/joystick_monitor.py
 ```
 
-完整启用流程见[手柄控制启用与测试指南](docs/TELEOP_USER_GUIDE.md)：加载已标定配置，启动 `teleop_simulation.launch.py`，通过 `gca_teleop_cli` 完成配置、激活、领取控制权、设参考及 ARM，再检查推进、旋转、LT 和 B。手柄节点持有控制权时，管理命令使用同一代理，不同时运行 `gca_cli shell` 领取另一份控制权。
+**原双轴模拟：**按[手柄控制启用与测试指南](docs/TELEOP_USER_GUIDE.md)加载已标定配置，启动 `teleop_simulation.launch.py`，通过 `gca_teleop_cli` 完成配置、激活、领取控制权、设模拟参考及 ARM。手柄节点持有控制权时，管理命令使用同一代理，不同时运行 `gca_cli shell` 领取另一份控制权。
 
-当前实体输入的 `event_age` 模式在静态保持约 0.15 秒后停车；本机标定文件位于不进入 Git 的 `artifacts/`，新克隆须另行完成映射采集。实体持续双轴控制、无线资格及真实执行器尚未验收，指南中的运动步骤使用模拟执行器。
+原双轴入口的 `event_age` 模式在静态保持约 0.15 秒后停车；此限制不适用于显式 `joydev_hold` 舵机入口。本机标定文件位于不进入 Git 的 `artifacts/`，新克隆须另行完成映射采集或保留完整的已有标定记录。
 
 ## 目录与阅读路径
 
@@ -57,8 +61,9 @@ python3 tools/joystick_monitor.py
 | `ros2_ws/src/system_bringup` | launch、仿真配置、禁止直接启用的硬件配置模板 |
 | `tests`、各包 `test` | 综合回归、ROS 进程集成、算法与设备测试 |
 | `tools` | 环境、构建、验证和报告入口 |
+| `config/servo_settings.py` | 不依赖 ROS 的舵机配置源，导出运行快照 |
 | `legacy` | 只读参考；不参与包发现、运行时导入或测试收集 |
 | `docs/prebuild_docs` | 实现前的设计与旧代码审查原文 |
-| `artifacts` | 可再生成的运行证据，不能作为源码或实测标定 |
+| `artifacts` | 本地运行、实测标定与验收记录，不进入 Git；原始实测证据应保留 |
 
 新使用者读 [文档导航](docs/README.md) 和 [用户指南](docs/USER_GUIDE.md)；维护者读 [架构](docs/ARCHITECTURE.md)、[ROS 接口](docs/ROS_INTERFACES.md) 和 [开发指南](docs/DEVELOPMENT.md)；准备接实物时读 [迁移说明](docs/SDK_MIGRATION.md)、[接线说明](docs/HARDWARE_WIRING.md) 和 [HIL 验收](docs/HIL_ACCEPTANCE.md)。第三方依赖与项目许可状态见 [许可说明](docs/THIRD_PARTY_NOTICES.md)。

@@ -89,4 +89,4 @@ git diff --cached
 git commit -m "Describe the change"
 ```
 
-仓库目前仅在本机；需要远程备份时，再为它配置用户指定的远程仓库并推送。
+当前远程 `origin` 为 `https://github.com/JixiongRen/mcrs_ros2_proj.git`，`main` 跟踪 `origin/main`。提交经核对的源码、配置和文档；本地 `artifacts/` 中的实体标定与实机记录继续保留，不随源码推送。
