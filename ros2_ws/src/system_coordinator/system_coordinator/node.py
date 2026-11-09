@@ -24,6 +24,7 @@ from gca_system_interfaces.srv import (
     InjectFault,
     ManageDevice,
 )
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -63,6 +64,7 @@ class SystemCoordinator(Node):
         self.declare_parameter("handover_timeout_s", 2.0)
         self.declare_parameter("profile", "gca_only")
         self.declare_parameter("servo_config_file", "")
+        self.declare_parameter("control_mode", "", ParameterDescriptor(read_only=True))
         self._profile = self.get_parameter("profile").value
         if self._profile not in ("gca_only", "servo"):
             raise ValueError("Only explicit gca_only and servo profiles are enabled")
@@ -100,6 +102,9 @@ class SystemCoordinator(Node):
         self._highwater = {}
         self._motion_permits = MotionPermits()
         servo_config_file = self.get_parameter("servo_config_file").value
+        requested_mode = self.get_parameter("control_mode").value
+        self._control_mode = ""
+        self._control_policy = "LEGACY_DUAL_AXIS"
         self._held_servo_input = False
         if servo_config_file:
             if self._profile != "servo":
@@ -107,6 +112,10 @@ class SystemCoordinator(Node):
             from gca.servo_config import load_servo_settings
 
             settings = load_servo_settings(servo_config_file)
+            if requested_mode and requested_mode != settings.control_mode:
+                raise ValueError("control_mode must match the validated servo snapshot")
+            self._control_mode = settings.control_mode
+            self._control_policy = settings.control_policy
             self._held_servo_input = settings.manual_hold_enabled
             self._quality = QualityTracker(
                 backend=settings.backend,
@@ -115,7 +124,14 @@ class SystemCoordinator(Node):
                 allow_joydev_hold=settings.manual_hold_enabled,
             )
         else:
-            # Existing launch files retain the qualified/legacy contract.
+            if self._profile == "servo":
+                # Previous manual entry points did not pass a snapshot to the coordinator.
+                if requested_mode not in ("", "manual"):
+                    raise ValueError("position control requires a validated servo snapshot")
+                self._control_mode = "manual"
+                self._control_policy = "MANUAL_SERVO_VELOCITY"
+            elif requested_mode:
+                raise ValueError("control_mode requires the servo profile")
             self._quality = QualityTracker()
         self._stop_epoch = 0
         self._pending_jog = None
@@ -124,6 +140,7 @@ class SystemCoordinator(Node):
         self._jog_stopping = None
         self._state = GcaState()
         self._state.state = "INITIALIZING"
+        self._state.control_policy = self._control_policy
         self._retired_boots = deque(maxlen=64)
         self._guard = self.create_guard_condition(self._drain, callback_group=self.action_group)
         self._device_action = ActionClient(
@@ -394,21 +411,21 @@ class SystemCoordinator(Node):
         )
 
     def _lease_request(self, source, duration, release=False):
+        self._validate_source_mode(source.mode)
         request = ExecutionLease.Request()
         request.coordinator_key = self._key
         request.context = self._domain_context(source)
         request.token = source.executor_token
         request.lease_s = duration
         request.release = release
-        if self._profile == "gca_only":
-            request.control_policy = "LEGACY_DUAL_AXIS"
-        elif source.mode == "MANUAL":
-            request.control_policy = "MANUAL_SERVO_VELOCITY"
-        elif source.mode == "AUTO":
-            request.control_policy = "POSITION_EXTERNAL_ENCODER"
-        else:
-            raise SessionError("CONTROL_MODE_UNSUPPORTED")
+        request.control_policy = self._control_policy
         return request
+
+    def _validate_source_mode(self, mode):
+        if self._profile == "servo":
+            expected = "AUTO" if self._control_mode == "position" else "MANUAL"
+            if mode != expected:
+                raise SessionError("CONTROL_MODE_MISMATCH")
 
     def _motion_permit(self, request, response):
         try:
@@ -445,6 +462,7 @@ class SystemCoordinator(Node):
         try:
             if operation == "claim_control":
                 with self._lock:
+                    self._validate_source_mode(request.mode or "AUTO")
                     if any(not task.committed for task in self._tasks.values()):
                         raise SessionError("CONTROL_BUSY")
                     source = self._authority.claim(
@@ -659,7 +677,13 @@ class SystemCoordinator(Node):
             if self._profile == "servo":
                 if source.mode != "AUTO":
                     raise SessionError("AUTO_MODE_REQUIRED")
-                raise SessionError("EXTERNAL_ENCODER_POSITION_UNSUPPORTED")
+                self._validate_source_mode(source.mode)
+                if (
+                    request.target.axis_mask != 1
+                    or request.target.rotation_rad != 0.0
+                    or request.end_policy != 1
+                ):
+                    raise SessionError("POSITION_LINEAR_STOP_REQUIRED")
             if not self._state.lifecycle_active or not self._state.armed:
                 raise SessionError("NOT_ARMED")
             if self._state.state != "READY":
@@ -877,6 +901,8 @@ class SystemCoordinator(Node):
         self._enqueue(record, result)
 
     def _jog(self, request):
+        if self._profile == "servo" and self._control_mode != "manual":
+            return
         stage = "authorization"
         try:
             if not request.deadman:
@@ -1053,6 +1079,11 @@ class SystemCoordinator(Node):
                     if newer_stop:
                         updated.stop_serial = state.stop_serial
                         updated.stop = copy.deepcopy(state.stop)
+                    else:
+                        # A frozen control owner cannot refresh stop evidence.
+                        # Preserve committed progress, but revoke aged observations.
+                        updated.stop.servo_confirmed &= state.stop.servo_confirmed
+                        updated.stop.linear_confirmed &= state.stop.linear_confirmed
                 updated.stamp = state.stamp
                 self._state = updated
                 return True

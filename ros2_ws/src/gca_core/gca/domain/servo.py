@@ -46,3 +46,5 @@ class FeedRuntimeState(RuntimeState):
     stop_evidence: str = "UNKNOWN"
     servo: ServoState = field(default_factory=ServoState)
     control_policy: str = MANUAL_SERVO_VELOCITY
+    servo_stop_confirmed: bool = False
+    linear_stop_confirmed: bool = False

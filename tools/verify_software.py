@@ -30,7 +30,9 @@ PYTHON = ROOT / ".venv/bin/python"
 COLCON = [str(PYTHON), "-c", "from colcon_core.command import main; raise SystemExit(main())"]
 PACKAGES = [
     "gca_core",
+    "gca_position",
     "gca_system_interfaces",
+    "gca_client",
     "gca_ros",
     "system_coordinator",
     "gca_teleop",
@@ -401,6 +403,8 @@ def main() -> int:
                 str(workspace / "src" / p / "test")
                 for p in (
                     "gca_core",
+                    "gca_position",
+                    "gca_client",
                     "gca_ros",
                     "system_coordinator",
                     "system_bringup",

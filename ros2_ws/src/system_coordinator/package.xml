@@ -8,6 +8,7 @@
   <exec_depend>rclpy</exec_depend><exec_depend>gca_system_interfaces</exec_depend>
   <exec_depend>gca_core</exec_depend><exec_depend>gca_ros</exec_depend><exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>lifecycle_msgs</exec_depend><exec_depend>python3-yaml</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
   <test_depend>ament_pytest</test_depend>
   <export><build_type>ament_python</build_type></export>
 </package>

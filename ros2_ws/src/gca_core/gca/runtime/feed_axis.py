@@ -1,8 +1,7 @@
-"""ROS-independent native-RPM feed runtime with one physical I/O owner.
+"""Feed runtime with one servo owner and an optional external-position strategy.
 
-There is no external encoder, pulse engine, reference or position controller.
-The control owner writes business state; the I/O owner independently expires
-outputs and disables torque even if control computation stops progressing.
+Manual mode has no encoder dependency. The control owner writes task state;
+the servo owner independently revokes stale output even if control stalls.
 """
 
 from collections import OrderedDict, deque
@@ -18,9 +17,11 @@ from uuid import uuid4
 from gca.acquisition.buffers import Latest
 from gca.algorithms.control import slew
 from gca.domain.manual import QualityTracker
-from gca.domain.models import DeviceError, OperationResult
+from gca.domain.models import DeviceError, MotionCommand, MotionEvent, OperationResult
+from gca.domain.position import PositionComponents
 from gca.domain.servo import (
     MANUAL_SERVO_VELOCITY,
+    POSITION_EXTERNAL_ENCODER,
     FeedRuntimeState,
     ServoJogCommand,
     ServoState,
@@ -38,6 +39,10 @@ class _VelocityDemand:
     expires_ns: int
     feedback_ns: int
     stop_serial: int
+    encoder_ns: int = 0
+    encoder_seq: int = 0
+    encoder_epoch: str = ""
+    reference_id: str = ""
 
 
 class FeedAxisRuntime(RuntimeAuthority):
@@ -51,10 +56,32 @@ class FeedAxisRuntime(RuntimeAuthority):
 
     allowed_control_policies = (MANUAL_SERVO_VELOCITY,)
 
-    def __init__(self, config: ServoSettings, notify=None, drive=None, clock=monotonic_ns):
+    def __init__(
+        self,
+        config: ServoSettings,
+        notify=None,
+        drive=None,
+        clock=monotonic_ns,
+        position: PositionComponents | None = None,
+    ):
         if not isinstance(config, ServoSettings):
             raise ValueError("validated ServoSettings required")
         self.config, self.notify, self.clock = config, notify, clock
+        if (config.control_mode == "position") != (position is not None):
+            raise ValueError("position components must match configured control mode")
+        self.allowed_control_policies = (config.control_policy,)
+        self._position = position
+        self._position_feedback = None
+        self._position_fault_code = ""
+        self._position_output = None
+        self._reservation = self._motion = None
+        self._reservation_deadline = self._motion_deadline = 0
+        self._reservation_target = 0.0
+        self._motion_target = 0.0
+        self._fingerprints = {}
+        self._events = deque()
+        self._terminal = None
+        self._cancel_requested = False
         self.drive = drive
         self._lock, self._stop_lock = Lock(), Lock()
         self._wake, self._shutdown, self._ready = Event(), Event(), Event()
@@ -97,6 +124,7 @@ class FeedAxisRuntime(RuntimeAuthority):
             requested_config_revision=config.revision,
             applied_config_revision=config.revision,
             calibration_id="",
+            control_policy=config.control_policy,
         )
 
     @property
@@ -108,6 +136,11 @@ class FeedAxisRuntime(RuntimeAuthority):
             return OperationResult(True)
         if self._shutdown.is_set():
             return OperationResult(False, "REINITIALIZE_REQUIRED")
+        if self._position:
+            result = self._position.acquisition.start(self._position_fault)
+            if not result:
+                self._position.acquisition.close()
+                return result
         thread = Thread(target=self._io_owner, name="gca-feed-servo-io", daemon=True)
         self._threads.append(thread)
         thread.start()
@@ -115,6 +148,8 @@ class FeedAxisRuntime(RuntimeAuthority):
             code, message = self._start_error or ("INITIALIZATION_TIMEOUT", "")
             self._shutdown.set()
             thread.join(self.config.stop_timeout_s)
+            if self._position:
+                self._position.acquisition.close()
             self._state = replace(
                 self._state,
                 state="FAULT",
@@ -132,6 +167,8 @@ class FeedAxisRuntime(RuntimeAuthority):
         ):
             self._shutdown.set()
             thread.join(self.config.stop_timeout_s)
+            if self._position:
+                self._position.acquisition.close()
             self._state = replace(
                 self._state,
                 state="FAULT",
@@ -156,6 +193,8 @@ class FeedAxisRuntime(RuntimeAuthority):
                 "config_sha256": self.config.sha256,
                 "identity": asdict(self.drive.identity),
                 "configuration_readback": dict(self.drive.configuration_readback),
+                "control_policy": self.config.control_policy,
+                **({"position_parameters": asdict(self.config.position)} if self._position else {}),
             }
         )
         self._publish_state(self.clock())
@@ -198,6 +237,8 @@ class FeedAxisRuntime(RuntimeAuthority):
         return self.renew(lease) if self._lease else self.arm(lease)
 
     def jog(self, command):
+        if self._position:
+            return OperationResult(False, "CONTROL_POLICY_MISMATCH")
         if not isinstance(command, ServoJogCommand):
             return OperationResult(False, "SERVO_COMMAND_REQUIRED")
         if command.deadman is False:
@@ -214,6 +255,9 @@ class FeedAxisRuntime(RuntimeAuthority):
             return OperationResult(False, "NOT_RUNNING")
         if command_id and self._jog and command_id != self._jog.context.command_id:
             return OperationResult(False, "COMMAND_MISMATCH")
+        active = self._motion or self._reservation
+        if command_id and active and command_id != active.context.command_id:
+            return OperationResult(False, "COMMAND_MISMATCH")
         if (
             context is not None
             and self._lease is not None
@@ -223,6 +267,8 @@ class FeedAxisRuntime(RuntimeAuthority):
             )
         ):
             return OperationResult(False, "INVALID_PERMISSION")
+        if active:
+            self._cancel_requested = True
         self._latch_stop(reason, disarm=disarm, context=context)
         return OperationResult(True, "STOP_ACCEPTED")
 
@@ -257,15 +303,22 @@ class FeedAxisRuntime(RuntimeAuthority):
     reset_fault = reset
 
     def set_reference(self, axis_mask=3, linear_mm=0.0, rotation_deg=0.0):
-        return OperationResult(False, "EXTERNAL_ENCODER_REQUIRED")
+        if not self._position:
+            return OperationResult(False, "EXTERNAL_ENCODER_REQUIRED")
+        return self._invoke("reference", (axis_mask, linear_mm, rotation_deg))
 
     def reserve(self, command):
-        return OperationResult(False, "POSITION_CONTROL_UNAVAILABLE")
+        if not self._position:
+            return OperationResult(False, "POSITION_CONTROL_UNAVAILABLE")
+        return self._invoke("reserve", command)
 
-    start_motion = reserve
+    def start_motion(self, command):
+        if not self._position:
+            return OperationResult(False, "POSITION_CONTROL_UNAVAILABLE")
+        return self._invoke("motion", command)
 
     def release_reservation(self, command_id):
-        return OperationResult(False, "POSITION_CONTROL_UNAVAILABLE")
+        return self._invoke("release", command_id)
 
     def configure(self, config):
         if self._state.armed or self._state.stop_progress != "CONFIRMED":
@@ -275,13 +328,15 @@ class FeedAxisRuntime(RuntimeAuthority):
         )
 
     def drain_events(self):
-        # Position Action is explicitly unavailable, hence no terminal events.
-        return []
+        with self._lock:
+            events = list(self._events)
+            self._events.clear()
+        return events
 
     pop_events = drain_events
 
     def commit_terminal(self, command_id, outcome):
-        return OperationResult(False, "POSITION_CONTROL_UNAVAILABLE")
+        return self._invoke("terminal", (command_id, outcome))
 
     def get_command_status(self, command_id):
         with self._lock:
@@ -303,15 +358,29 @@ class FeedAxisRuntime(RuntimeAuthority):
         result = replace(
             state,
             servo=servo,
+            servo_stop_confirmed=state.servo_stop_confirmed and servo.valid,
             sample_age_s=max(0.0, age),
             stop_serial=self.stop_serial,
             lease_remaining_s=max(0.0, (self._lease_deadline - now) / 1e9),
         )
+        if self._position:
+            feedback = self._position_feedback
+            age = (now - feedback.evidence_ns) / 1e9 if feedback else 1e9
+            fresh = self._position_evidence_valid(now, require_reference=False)
+            result = replace(
+                result,
+                sample_age_s=max(0.0, age),
+                linear_valid=result.linear_valid and fresh,
+                velocity_valid=result.velocity_valid and fresh,
+                linear_stop_confirmed=result.linear_stop_confirmed and fresh,
+            )
         if self._handled_stop_serial < self.stop_serial:
             result = replace(
                 result,
                 stop_progress="REQUESTED",
                 stop_evidence="",
+                servo_stop_confirmed=False,
+                linear_stop_confirmed=False,
                 servo=replace(servo, requested_velocity_rpm=0.0),
             )
         return result
@@ -349,6 +418,9 @@ class FeedAxisRuntime(RuntimeAuthority):
             self._wake.set()
             for thread in self._threads:
                 thread.join(max(0.0, (deadline - monotonic_ns()) / 1e9))
+            if self._position:
+                self._position.acquisition.close()
+                self._position.feedback.invalidate("SHUTDOWN")
             if any(thread.is_alive() for thread in self._threads):
                 return OperationResult(False, "SHUTDOWN_TIMEOUT")
             self._consume_io_receipts()
@@ -369,6 +441,10 @@ class FeedAxisRuntime(RuntimeAuthority):
         self._wake.set()
         for thread in self._threads:
             thread.join(max(0.0, (deadline - monotonic_ns()) / 1e9))
+        if self._position:
+            self._position.acquisition.close()
+            self._position.feedback.invalidate("SHUTDOWN")
+            self._position_feedback = self._position.feedback.snapshot(self.clock())
         self._started = False
         if any(thread.is_alive() for thread in self._threads):
             return OperationResult(False, "SHUTDOWN_TIMEOUT")
@@ -399,6 +475,306 @@ class FeedAxisRuntime(RuntimeAuthority):
             and sample.watchdog_raw == self.config.device.watchdog_raw
         )
 
+    def _position_fault(self, code):
+        """Acquisition may revoke output even while the control owner is stalled."""
+        self._position_fault_code = code
+        if self._started and self._state.armed and not self._emergency:
+            self._emergency = code
+            self._latch_stop(code, disarm=True, fault=True)
+
+    def _position_evidence_valid(self, now, demand=None, *, require_reference=True):
+        if not self._position or self._position_fault_code:
+            return False
+        source = self._position.acquisition.snapshot()
+        feedback, sample = self._position_feedback, source.sample
+        age_ns = int(self.config.position.encoder.feedback_max_age_s * 1e9)
+        if not (source.healthy and sample and feedback and sample.valid):
+            return False
+        sample_ns = sample.request_started_ns or sample.received_ns
+        if (
+            not 0 <= now - sample_ns <= age_ns
+            or not 0 <= now - feedback.evidence_ns <= age_ns
+            or sample.received_ns > now
+            or feedback.sampled_ns > now
+            or not 0 < feedback.seq <= sample.seq
+            or sample.device_epoch != feedback.device_epoch
+            or feedback.error_code
+            or (require_reference and not (feedback.position_valid and feedback.reference_id))
+        ):
+            return False
+        return demand is None or bool(
+            0 <= now - demand.encoder_ns <= age_ns
+            and 0 < demand.encoder_seq <= feedback.seq
+            and demand.encoder_epoch == feedback.device_epoch
+            and demand.reference_id == feedback.reference_id
+        )
+
+    def _update_position(self, now):
+        if not self._position:
+            return
+        source = self._position.acquisition.snapshot()
+        if self._position_fault_code or not source.healthy:
+            self._position.feedback.invalidate(
+                self._position_fault_code or source.error_code or "ENCODER_UNAVAILABLE"
+            )
+        elif source.sample is not None:
+            self._position.feedback.update(source.sample, now)
+        self._position_feedback = self._position.feedback.snapshot(now)
+        if self._state.armed and not self._position_evidence_valid(now):
+            code = self._position_feedback.error_code or "ENCODER_FEEDBACK_STALE"
+            self._position_fault(code)
+
+    def _validate_position_command(self, command, now, target=None):
+        if not isinstance(command, MotionCommand):
+            return OperationResult(False, "INVALID_COMMAND")
+        result = self._validate_manual_permission(command.context, command.freshness_token, now)
+        if not result:
+            return result
+        if self._lease.control_policy != POSITION_EXTERNAL_ENCODER:
+            return OperationResult(False, "CONTROL_POLICY_MISMATCH")
+        if (
+            type(command.axis_mask) is not int
+            or command.axis_mask != 1
+            or type(command.mode) is not int
+            or command.mode not in (1, 2)
+            or type(command.end_policy) is not int
+            or command.end_policy != 1
+            or not all(
+                type(v) in (float, int) and isfinite(v)
+                for v in (
+                    command.linear_mm,
+                    command.rotation_deg,
+                    command.admission_timeout_s,
+                    command.execution_timeout_s,
+                    command.limits.max_linear_mm_s,
+                    command.limits.max_linear_mm_s2,
+                )
+            )
+            or command.rotation_deg != 0
+            or not 0 < command.admission_timeout_s <= 5.0
+            or not 0 < command.execution_timeout_s <= 3600.0
+            or type(command.admission_deadline_ns) is not int
+            or command.admission_deadline_ns < 0
+        ):
+            return OperationResult(False, "INVALID_POSITION_COMMAND")
+        if command.admission_deadline_ns and now >= command.admission_deadline_ns:
+            return OperationResult(False, "COMMAND_EXPIRED")
+        if not self._position_evidence_valid(now):
+            return OperationResult(False, "LINEAR_REFERENCE_INVALID")
+        feedback, motion = self._position_feedback, self.config.position.motion
+        if not feedback.velocity_valid:
+            return OperationResult(False, "ENCODER_VELOCITY_INVALID")
+        if command.reference_id != feedback.reference_id:
+            return OperationResult(False, "REFERENCE_MISMATCH")
+        if not (
+            0 < command.limits.max_linear_mm_s <= motion.max_linear_mm_s
+            and 0 < command.limits.max_linear_mm_s2 <= motion.max_linear_mm_s2
+        ):
+            return OperationResult(False, "MOTION_LIMIT")
+        if target is None:
+            target = command.linear_mm + (feedback.position_mm if command.mode == 2 else 0.0)
+        if not motion.target_min_mm <= target <= motion.target_max_mm:
+            return OperationResult(False, "LINEAR_LIMIT")
+        if self._state.state != "READY" or self._stopping or self._stop_request:
+            return OperationResult(False, "CONTROL_BUSY")
+        if abs(feedback.velocity_mm_s) > motion.velocity_tolerance_mm_s:
+            return OperationResult(False, "NOT_STATIONARY")
+        return OperationResult(True)
+
+    def _handle_position(self, kind, value, now):
+        serial = self.stop_serial
+        if kind == "reference":
+            mask, linear, rotation = value
+            if (
+                type(mask) is not int
+                or mask != 1
+                or rotation != 0
+                or type(linear) not in (float, int)
+                or not isfinite(linear)
+            ):
+                return OperationResult(False, "INVALID_REFERENCE")
+            if (
+                self._state.armed
+                or self._state.state != "DISARMED"
+                or self._emergency
+                or self._motion
+                or self._reservation
+                or self._stopping
+            ):
+                return OperationResult(False, "REFERENCE_BUSY")
+            if (
+                self._state.stop_progress != "CONFIRMED"
+                or not self._fresh(self._sample.get(), now)
+                or not self._position_evidence_valid(now, require_reference=False)
+            ):
+                return OperationResult(False, "FEEDBACK_STALE")
+            feedback = self._position_feedback
+            if (
+                not feedback.velocity_valid
+                or abs(feedback.velocity_mm_s) > self.config.position.motion.velocity_tolerance_mm_s
+            ):
+                return OperationResult(False, "NOT_STATIONARY")
+            result = self._position.feedback.set_reference(float(linear), now)
+            self._position_feedback = self._position.feedback.snapshot(now)
+            return result
+        if kind == "release":
+            if self._reservation and self._reservation.context.command_id == value:
+                self._history[value] = "RELEASED"
+                self._reservation = None
+            return OperationResult(True)
+        if kind == "terminal":
+            cid, outcome = value
+            if not self._terminal or (cid, outcome) != (
+                self._terminal.command_id,
+                self._terminal.outcome,
+            ):
+                return OperationResult(False, "TERMINAL_MISMATCH")
+            self._history[cid] = outcome
+            self._records.append(
+                {
+                    "time_ns": now,
+                    "kind": "position_terminal",
+                    **asdict(self._terminal),
+                    "target_position_mm": self._motion_target,
+                    "feedback": asdict(self._position_feedback),
+                }
+            )
+            self._motion = self._terminal = None
+            self._cancel_requested = False
+            self._state = replace(self._state, task_id="", command_id="")
+            return OperationResult(True)
+        command = value
+        if kind == "motion" and (self._reservation != command or now >= self._reservation_deadline):
+            return OperationResult(False, "RESERVATION_INVALID")
+        result = self._validate_position_command(
+            command, now, self._reservation_target if kind == "motion" else None
+        )
+        if not result:
+            return result
+        if kind == "reserve":
+            cid = command.context.command_id
+            fingerprint = repr(
+                replace(
+                    command, freshness_token="", admission_deadline_ns=0, admission_timeout_s=0.0
+                )
+            )
+            if cid in self._fingerprints:
+                return OperationResult(
+                    False,
+                    "DUPLICATE_COMMAND"
+                    if self._fingerprints[cid] == fingerprint
+                    else "ID_CONFLICT",
+                )
+            key = (command.context.session_id, command.context.generation)
+            if command.context.sequence <= self._highwater.get(key, -1):
+                return OperationResult(False, "STALE_SEQUENCE")
+            if self._reservation or self._motion or self._terminal:
+                return OperationResult(False, "CONTROL_BUSY")
+            self._reservation = command
+            self._reservation_target = command.linear_mm + (
+                self._position_feedback.position_mm if command.mode == 2 else 0.0
+            )
+            self._reservation_deadline = min(
+                self._lease_deadline,
+                now + int(command.admission_timeout_s * 1e9),
+                command.admission_deadline_ns or self._lease_deadline,
+            )
+            self._fingerprints[cid], self._history[cid] = fingerprint, "ACCEPTED"
+            self._highwater[key] = command.context.sequence
+            while len(self._history) > self.config.history_capacity:
+                old, _ = self._history.popitem(last=False)
+                self._fingerprints.pop(old, None)
+            return OperationResult(True)
+        feedback = self._position_feedback
+        target = self._reservation_target
+        self._position.strategy.start(
+            target, command.limits.max_linear_mm_s, command.limits.max_linear_mm_s2, feedback, now
+        )
+        with self._stop_lock:
+            if serial != self.stop_serial or self._stop_request:
+                self._position.strategy.stop()
+                return OperationResult(False, "STOP_SUPERSEDED")
+            self._motion, self._reservation, self._motion_target = command, None, target
+            self._motion_deadline = now + int(command.execution_timeout_s * 1e9)
+            self._cancel_requested = False
+            self._armed_stop_serial = serial
+            self._output_generation += 1
+            self._permit = self._torque_requested = True
+            self._state = replace(
+                self._state,
+                state="EXECUTING",
+                command_id=command.context.command_id,
+                task_id=command.context.task_id,
+                target_linear_mm=target,
+            )
+        self._history[command.context.command_id] = "EXECUTING"
+        return OperationResult(True)
+
+    def _advance_position(self, now):
+        if now >= self._motion_deadline:
+            self._latch_stop("EXECUTION_TIMEOUT", disarm=True, fault=True)
+            return
+        if not self._position_evidence_valid(now):
+            self._position_fault("ENCODER_FEEDBACK_STALE")
+            return
+        output = self._position.strategy.step(
+            self._position_feedback, now, self._output_seq + 1, self._output_generation
+        )
+        if output is None:
+            return
+        self._position_output = output
+        if output.complete:
+            self._latch_stop("POSITION_REACHED")
+            return
+        self._output_seq += 1
+        self._limited_rpm = output.rpm
+        feedback = output.feedback
+        self._demand.put(
+            _VelocityDemand(
+                output.rpm,
+                self._output_seq,
+                self._output_generation,
+                min(now + int(self.config.output_ttl_s * 1e9), self._motion_deadline),
+                self._sample.get().received_ns,
+                self.stop_serial,
+                feedback.evidence_ns,
+                feedback.seq,
+                feedback.device_epoch,
+                feedback.reference_id,
+            )
+        )
+
+    def _finish_position(self, stop, confirmed, now):
+        if not self._motion:
+            return
+        outcome, code = "CANCELED", stop["reason"]
+        if not confirmed or stop["fault"] or stop["reason"] == "LEASE_EXPIRED":
+            outcome, code = "FAILED", (stop["reason"] if confirmed else "STOP_TIMEOUT")
+        elif stop["reason"] == "POSITION_REACHED" and not self._cancel_requested:
+            feedback = self._position_feedback
+            if (
+                self._position_evidence_valid(now)
+                and feedback.sampled_ns >= stop["start"]
+                and self._position.strategy.at_target(feedback, self._motion_target)
+            ):
+                outcome, code = "SUCCEEDED", "OK"
+            else:
+                outcome, code = "FAILED", "FINAL_POSITION_INVALID"
+        event = MotionEvent(
+            self._motion.context.command_id,
+            outcome,
+            code,
+            outputs_held=False,
+            stop_confirmed=confirmed,
+        )
+        with self._lock:
+            # A late cancel supersedes a success candidate until ROS commits it.
+            self._events.clear()
+            self._events.append(event)
+            self._terminal = event
+        if self.notify:
+            self.notify()
+
     def _handle(self, kind, value, now):
         if kind == "active":
             self._active_lifecycle = value
@@ -412,7 +788,11 @@ class FeedAxisRuntime(RuntimeAuthority):
                     return OperationResult(False, "STOP_SUPERSEDED")
                 if type(input_deadline) is not int or input_deadline < 0:
                     return OperationResult(False, "INPUT_DEADLINE_INVALID")
-                if self.config.backend == "hardware" and not now < input_deadline:
+                if (
+                    not self._position
+                    and self.config.backend == "hardware"
+                    and not now < input_deadline
+                ):
                     return OperationResult(False, "INPUT_NOT_QUALIFIED")
             result = self._validate_lease(value, now, renewal=kind == "renew")
             if not result:
@@ -429,6 +809,16 @@ class FeedAxisRuntime(RuntimeAuthority):
                     return OperationResult(False, "SERVO_NOT_STATIONARY")
                 if self._state.stop_progress != "CONFIRMED":
                     return OperationResult(False, "STOP_NOT_CONFIRMED")
+                if self._position:
+                    if not self._position_evidence_valid(now):
+                        return OperationResult(False, "LINEAR_REFERENCE_INVALID")
+                    feedback = self._position_feedback
+                    if (
+                        not feedback.velocity_valid
+                        or abs(feedback.velocity_mm_s)
+                        > self.config.position.motion.velocity_tolerance_mm_s
+                    ):
+                        return OperationResult(False, "ENCODER_NOT_STATIONARY")
                 value = replace(value, token=value.token or token_urlsafe(24))
                 with self._stop_lock:
                     if expected != self.stop_serial or self._stop_request is not None:
@@ -457,6 +847,10 @@ class FeedAxisRuntime(RuntimeAuthority):
             return OperationResult(True, token=value.token)
         if kind == "jog":
             return self._accept_jog(value, now)
+        if kind in ("reference", "reserve", "motion", "release", "terminal"):
+            if not self._position:
+                return OperationResult(False, "POSITION_CONTROL_UNAVAILABLE")
+            return self._handle_position(kind, value, now)
         if kind == "reset":
             if self._stopping or self._state.stop_progress != "CONFIRMED":
                 return OperationResult(False, "STOP_NOT_CONFIRMED")
@@ -464,9 +858,15 @@ class FeedAxisRuntime(RuntimeAuthority):
                 return OperationResult(False, "RESET_BUSY")
             if not self._fresh(self._sample.get(), now) or not self._threads[0].is_alive():
                 return OperationResult(False, "DEVICE_REINITIALIZE_REQUIRED")
+            if self._position and not self._position.acquisition.snapshot().healthy:
+                return OperationResult(False, "ENCODER_REINITIALIZE_REQUIRED")
             self._revoke_current_lease()
             self._lease, self._lease_deadline = None, 0
             self._emergency = ""
+            if self._position:
+                self._position_fault_code = ""
+                self._position.feedback.invalidate("RESET_REFERENCE_REQUIRED")
+                self._position_feedback = self._position.feedback.snapshot(now)
             self._state = replace(self._state, state="DISARMED", armed=False, error_code="")
             return OperationResult(True)
         return OperationResult(False, "UNKNOWN_OPERATION")
@@ -567,12 +967,15 @@ class FeedAxisRuntime(RuntimeAuthority):
                     self._tick()
                 except Exception as exc:
                     self._state = replace(self._state, message=str(exc))
-                    self._latch_stop("CONTROL_EXCEPTION", disarm=True, fault=True)
+                    self._latch_stop(
+                        getattr(exc, "code", "CONTROL_EXCEPTION"), disarm=True, fault=True
+                    )
             self._wake.wait(self.config.control_period_s)
             self._wake.clear()
 
     def _tick(self):
         now = self.clock()
+        self._update_position(now)
         with self._stop_lock:
             pending = self._stop_request
             self._stop_request = None
@@ -590,7 +993,8 @@ class FeedAxisRuntime(RuntimeAuthority):
             try:
                 result = (
                     OperationResult(False, "STOP_SUPERSEDED")
-                    if kind in ("arm", "jog") and serial != self.stop_serial
+                    if kind in ("arm", "jog", "reserve", "motion", "reference")
+                    and serial != self.stop_serial
                     else self._handle(kind, value, self.clock())
                 )
             except Exception as exc:
@@ -599,6 +1003,9 @@ class FeedAxisRuntime(RuntimeAuthority):
             done.set()
         self._consume_io_receipts()
         now = self.clock()
+        if self._reservation and now >= self._reservation_deadline:
+            self._history[self._reservation.context.command_id] = "RESERVATION_EXPIRED"
+            self._reservation = None
         if self._state.armed and now >= self._lease_deadline and self._stopping is None:
             self._latch_stop("LEASE_EXPIRED", disarm=True)
         if (
@@ -609,6 +1016,8 @@ class FeedAxisRuntime(RuntimeAuthority):
             self._latch_stop("FEEDBACK_STALE", disarm=True, fault=True)
         if self._stopping is not None:
             self._advance_stop(now)
+        elif self._motion is not None and self._terminal is None and self._stop_request is None:
+            self._advance_position(now)
         elif self._jog is not None and self._stop_request is None:
             if now >= self._jog_deadline:
                 self._latch_stop("JOG_EXPIRED")
@@ -653,10 +1062,17 @@ class FeedAxisRuntime(RuntimeAuthority):
             current_motion = generation == self._output_generation and serial == self.stop_serial
             if stop_write or current_motion:
                 self._accepted_rpm = rpm
+                if self._position and seq and current_motion:
+                    self._position.strategy.accepted(seq, generation, rpm)
 
     def _begin_stop(self, reason, now, *, disarm=False, fault=False):
         self._permit = self._torque_requested = False
         self._demand.put(None)
+        if self._position:
+            self._position.strategy.stop()
+            self._position_output = None
+            if self._reservation and self._motion is None:
+                self._motion, self._reservation = self._reservation, None
         if self._stopping is not None:
             if fault and not self._stopping["fault"]:
                 self._stopping["reason"] = reason
@@ -735,6 +1151,8 @@ class FeedAxisRuntime(RuntimeAuthority):
             if not confirmed
             else (stop["reason"] if stop["fault"] else ""),
         )
+        if self._position:
+            self._finish_position(stop, confirmed, now)
 
     def _publish_state(self, now):
         sample = self._sample.get()
@@ -744,7 +1162,13 @@ class FeedAxisRuntime(RuntimeAuthority):
                 raw_position_count=sample.raw_position,
                 shaft_angle_rad=sample.angle_rad,
                 measured_velocity_rpm=sample.velocity_rpm,
-                requested_velocity_rpm=self._jog.velocity_rpm if self._jog else 0.0,
+                requested_velocity_rpm=(
+                    self._position_output.rpm
+                    if self._position_output
+                    else self._jog.velocity_rpm
+                    if self._jog
+                    else 0.0
+                ),
                 accepted_velocity_rpm=self._accepted_rpm,
                 torque_enabled=sample.enabled,
                 hardware_error=sample.hardware_error,
@@ -757,14 +1181,58 @@ class FeedAxisRuntime(RuntimeAuthority):
                 error_code=sample.error_code,
                 watchdog_raw=sample.watchdog_raw,
             )
+        position_state = {}
+        if self._position:
+            feedback = self._position_feedback
+            if feedback:
+                fresh = self._position_evidence_valid(now, require_reference=False)
+                position_state = dict(
+                    position_mm=feedback.position_mm,
+                    velocity_mm_s=feedback.velocity_mm_s,
+                    linear_valid=feedback.position_valid and fresh,
+                    velocity_valid=feedback.velocity_valid and fresh,
+                    linear_referenced=bool(feedback.reference_id),
+                    reference_id=feedback.reference_id,
+                    calibration_id=self.config.position.mechanics.calibration_id,
+                    sample_seq=feedback.seq,
+                    sample_received_ns=feedback.sampled_ns,
+                    sample_age_s=max(0.0, (now - feedback.evidence_ns) / 1e9),
+                    device_epoch=feedback.device_epoch,
+                    linear_stop_confirmed=bool(
+                        self._state.stop_progress == "CONFIRMED"
+                        and fresh
+                        and feedback.velocity_valid
+                        and abs(feedback.velocity_mm_s)
+                        <= self.config.position.motion.velocity_tolerance_mm_s
+                    ),
+                )
+            output = self._position_output
+            position_state.update(
+                reference_linear_mm=output.reference_position_mm if output else self._motion_target,
+                requested_velocity_mm_s=output.requested_mm_s if output else 0.0,
+                applied_velocity_mm_s=self.config.position.mechanics.mapping.rpm_to_velocity(
+                    self._accepted_rpm
+                ),
+            )
         with self._lock:
             self._state = replace(
                 self._state,
                 servo=servo,
-                sample_seq=servo.sample_seq,
-                sample_received_ns=servo.sampled_ns,
-                sample_age_s=servo.sample_age_s,
-                device_epoch=servo.device_epoch,
+                **(
+                    position_state
+                    or dict(
+                        sample_seq=servo.sample_seq,
+                        sample_received_ns=servo.sampled_ns,
+                        sample_age_s=servo.sample_age_s,
+                        device_epoch=servo.device_epoch,
+                    )
+                ),
+                servo_stop_confirmed=bool(
+                    self._state.stop_progress == "CONFIRMED"
+                    and servo.valid
+                    and not servo.torque_enabled
+                    and abs(servo.measured_velocity_rpm) <= self.config.velocity_tolerance_rpm
+                ),
                 state_seq=self._state.state_seq + 1,
                 output_generation=self._output_generation,
                 output_seq=self._output_seq,
@@ -782,6 +1250,26 @@ class FeedAxisRuntime(RuntimeAuthority):
                     "limited_velocity_rpm": self._limited_rpm,
                     "stop_reason": self._last_stop_reason,
                     "config_sha256": self.config.sha256,
+                    **(
+                        {
+                            "encoder_feedback": asdict(self._position_feedback)
+                            if self._position_feedback
+                            else None,
+                            "position_error_mm": (
+                                self._motion_target - self._position_feedback.position_mm
+                                if self._motion and self._position_feedback
+                                else None
+                            ),
+                            "position_output": asdict(self._position_output)
+                            if self._position_output
+                            else None,
+                            "encoder_request_started_ns": self._position_feedback.request_started_ns
+                            if self._position_feedback
+                            else 0,
+                        }
+                        if self._position
+                        else {}
+                    ),
                 }
             )
 
@@ -796,10 +1284,16 @@ class FeedAxisRuntime(RuntimeAuthority):
             and self._active_lifecycle
             and self._state.armed
             and self._lease is not None
-            and self._lease.control_policy == MANUAL_SERVO_VELOCITY
-            and now < min(demand.expires_ns, self._lease_deadline, self._input_deadline)
+            and self._lease.control_policy == self.config.control_policy
+            and now
+            < min(
+                demand.expires_ns,
+                self._lease_deadline,
+                self._motion_deadline if self._position else self._input_deadline,
+            )
             and demand.generation == self._output_generation
             and 0 <= now - demand.feedback_ns <= int(self.config.feedback_max_age_s * 1e9)
+            and (not self._position or self._position_evidence_valid(now, demand))
         )
 
     def _enable_allowed(self, deadline_ns, serial, lease_identity, for_jog):
@@ -819,10 +1313,11 @@ class FeedAxisRuntime(RuntimeAuthority):
                 and self._armed_stop_serial == serial
                 and self._lease is not None
                 and (self._lease.session_id, self._lease.generation) == lease_identity
-                and self._lease.control_policy == MANUAL_SERVO_VELOCITY
+                and self._lease.control_policy == self.config.control_policy
                 and now < min(deadline_ns, self._lease_deadline)
                 and (
-                    (self._jog is None and not for_jog)
+                    (self._position and self._position_evidence_valid(now))
+                    or (not self._position and self._jog is None and not for_jog)
                     or (
                         self._jog is not None
                         and self._permit
@@ -909,6 +1404,13 @@ class FeedAxisRuntime(RuntimeAuthority):
                     now = self.clock()
                     current_sample = self._sample.get()
                     if (
+                        self._position
+                        and self._state.armed
+                        and not self._position_evidence_valid(now)
+                        and not self._emergency
+                    ):
+                        self._position_fault("ENCODER_FEEDBACK_STALE")
+                    if (
                         self._state.armed
                         and not self._fresh(current_sample, now)
                         and not self._emergency
@@ -923,8 +1425,16 @@ class FeedAxisRuntime(RuntimeAuthority):
                     if self._permit and (
                         demand is not None and not self._valid_output(demand, now)
                     ):
-                        reason = "JOG_EXPIRED" if now >= self._jog_deadline else "OUTPUT_EXPIRED"
-                        self._latch_stop(reason)
+                        reason = (
+                            "OUTPUT_EXPIRED"
+                            if self._position
+                            else "JOG_EXPIRED"
+                            if now >= self._jog_deadline
+                            else "OUTPUT_EXPIRED"
+                        )
+                        self._latch_stop(
+                            reason, disarm=bool(self._position), fault=bool(self._position)
+                        )
                     elif (
                         self._state.armed and now >= self._lease_deadline and self._torque_requested
                     ):
@@ -952,7 +1462,11 @@ class FeedAxisRuntime(RuntimeAuthority):
                                 self.clock() + int(4 * self.config.io_timeout_s * 1e9),
                                 self._lease_deadline,
                             )
-                            if self.config.backend == "hardware" and not for_jog:
+                            if (
+                                not self._position
+                                and self.config.backend == "hardware"
+                                and not for_jog
+                            ):
                                 arm_deadline = min(arm_deadline, self._arm_input_deadline)
 
                         def enable_guard():
@@ -980,7 +1494,11 @@ class FeedAxisRuntime(RuntimeAuthority):
                             self._valid_output(demand, now)
                             and demand.seq != last_seq
                             and write_deadline
-                            <= min(demand.expires_ns, self._input_deadline, self._lease_deadline)
+                            <= min(
+                                demand.expires_ns,
+                                self._lease_deadline,
+                                self._motion_deadline if self._position else self._input_deadline,
+                            )
                         )
                     if write_allowed:
                         io_operation, io_deadline_ns = "write_velocity", write_deadline

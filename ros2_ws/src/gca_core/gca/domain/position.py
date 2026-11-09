@@ -1,16 +1,17 @@
-"""Future external-position strategy contracts; no encoder is instantiated here.
+"""Pure contracts for external-position feedback and its injected controller.
 
-Position strategy will reuse LinearEstimator and PositionController. A new
-sample is consumed once with its original time; limits are committed once and
-the device quantization residual once. Manual native-RPM control never imports
-or creates this strategy. No default mechanical calibration or PID gain exists.
+A new sample is consumed once with its original time; limits are committed once
+and the device quantization residual once. These contracts create no device and
+carry no default mechanical mapping or PID gains.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
 from typing import Protocol
 
-from gca.algorithms.control import ControllerOutput, boundary_velocity
+from gca.algorithms.control import boundary_velocity
+from gca.domain.models import EncoderSample, OperationResult
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,13 @@ class ExternalPositionFeedback:
     sampled_ns: int
     device_epoch: str
     reference_id: str
+    request_started_ns: int = 0
+    raw_count: int = 0
+    error_code: str = ""
+
+    @property
+    def evidence_ns(self):
+        return self.request_started_ns or self.sampled_ns
 
 
 @dataclass(frozen=True)
@@ -83,7 +91,7 @@ class MechanicalMapping:
             or not isinstance(self.calibration_id, str)
             or not self.calibration_id
         ):
-            raise ValueError("explicit measured mechanical calibration required")
+            raise ValueError("explicit mechanical mapping and provenance required")
 
     def velocity_to_rpm(self, velocity_mm_s: float) -> float:
         if type(velocity_mm_s) not in (int, float) or not isfinite(velocity_mm_s):
@@ -96,16 +104,44 @@ class MechanicalMapping:
         return self.direction_sign * rpm * self.mm_per_shaft_revolution / 60.0
 
 
-class ExternalPositionPort(Protocol):
-    """Only POSITION_EXTERNAL_ENCODER may own/start/read this future port."""
+@dataclass(frozen=True)
+class EncoderAcquisitionSnapshot:
+    sample: EncoderSample | None = None
+    healthy: bool = False
+    error_code: str = ""
 
-    def open(self) -> None: ...
-    def read(self, deadline_ns: int) -> ExternalPositionFeedback: ...
+
+class ExternalPositionPort(Protocol):
+    """Position-only raw acquisition; the control owner does estimation."""
+
+    def start(self, on_fault: Callable[[str], None] | None = None) -> OperationResult: ...
+    def snapshot(self) -> EncoderAcquisitionSnapshot: ...
     def close(self) -> None: ...
 
 
+class PositionFeedbackPort(Protocol):
+    def update(self, sample: EncoderSample, now_ns: int) -> ExternalPositionFeedback: ...
+    def snapshot(self, now_ns: int) -> ExternalPositionFeedback: ...
+    def set_reference(self, position_mm: float, now_ns: int) -> OperationResult: ...
+    def invalidate(self, reason: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class PositionOutput:
+    requested_mm_s: float
+    limited_mm_s: float
+    rpm: float
+    reference_position_mm: float
+    reference_velocity_mm_s: float
+    complete: bool
+    feedback: ExternalPositionFeedback
+    proportional: float = 0.0
+    integral: float = 0.0
+    derivative: float = 0.0
+
+
 class PositionStrategy(Protocol):
-    """Contract for future real-position PID; capability remains unavailable.
+    """Injected external-position PID and trajectory lifecycle.
 
     The owner resolves relative targets from fresh accepted feedback, verifies
     absolute reference_id, and enforces trajectory/position/velocity dwell and
@@ -113,22 +149,24 @@ class PositionStrategy(Protocol):
     step rejects duplicate/stale/invalid samples rather than integrating again.
     """
 
-    def reset(self) -> None: ...
-    def update_target(self, position_mm: float, reference_id: str) -> None: ...
-    def step(self, feedback: ExternalPositionFeedback, dt: float) -> ControllerOutput: ...
-    def commit_limited_output(
+    def start(
         self,
-        output_seq: int,
-        generation: int,
-        error_mm: float,
-        requested_mm_s: float,
-        limited_mm_s: float,
-        dt: float,
+        target_mm: float,
+        max_velocity_mm_s: float,
+        max_acceleration_mm_s2: float,
+        feedback: ExternalPositionFeedback,
+        now_ns: int,
     ) -> None: ...
-    def observe_accepted_output(
-        self,
-        output_seq: int,
-        generation: int,
-        accepted_mm_s: float,
-    ) -> None: ...
+    def step(
+        self, feedback: ExternalPositionFeedback, now_ns: int, output_seq: int, generation: int
+    ) -> PositionOutput | None: ...
+    def accepted(self, output_seq: int, generation: int, rpm: float) -> bool: ...
+    def at_target(self, feedback: ExternalPositionFeedback, target_mm: float) -> bool: ...
     def stop(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class PositionComponents:
+    acquisition: ExternalPositionPort
+    feedback: PositionFeedbackPort
+    strategy: PositionStrategy

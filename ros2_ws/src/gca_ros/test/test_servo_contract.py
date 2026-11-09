@@ -1,14 +1,16 @@
-"""Servo-only units, capability binding and disabled external position ingress."""
+"""Servo SI units, stop evidence and immutable source-mode binding."""
 
 import math
 from dataclasses import replace
 
+import pytest
 import rclpy
 from gca.domain.servo import FeedRuntimeState, ServoState
 from gca_ros.conversion import servo_jog_from_ros, state_from_core
 from gca_system_interfaces.action import ExecuteMotion
 from gca_system_interfaces.msg import CommandContext, GcaState, ServoJogCommand, StopStatus
 from rclpy.action import GoalResponse
+from system_coordinator.authority import SessionError
 from system_coordinator.node import SystemCoordinator
 
 
@@ -16,6 +18,7 @@ def test_servo_si_boundary_never_populates_external_axis_measurements():
     core = FeedRuntimeState(
         state="READY",
         stop_progress="CONFIRMED",
+        servo_stop_confirmed=True,
         servo=ServoState(
             raw_position_count=4096,
             shaft_angle_rad=2 * math.pi,
@@ -50,7 +53,7 @@ def test_servo_si_boundary_never_populates_external_axis_measurements():
     assert math.isclose(command.velocity_rpm, -3.0)
 
 
-def test_coordinator_binds_servo_source_mode_and_rejects_position_without_encoder():
+def test_legacy_servo_coordinator_is_fixed_manual_and_rejects_auto():
     rclpy.init(
         args=["--ros-args", "-p", "coordinator_key:=servo-contract-key", "-p", "profile:=servo"]
     )
@@ -72,11 +75,12 @@ def test_coordinator_binds_servo_source_mode_and_rejects_position_without_encode
         assert node._denials[request.context.command_id] == "AUTO_MODE_REQUIRED"
         node._authority.release()
         source = node._authority.claim("auto", "AUTO", 1.0)
-        assert node._lease_request(source, 0.5).control_policy == "POSITION_EXTERNAL_ENCODER"
+        with pytest.raises(SessionError, match="CONTROL_MODE_MISMATCH"):
+            node._lease_request(source, 0.5)
         request.context = node._domain_context(source)
         request.token = source.token + ".test"
         assert node._goal(request) == GoalResponse.REJECT
-        assert node._denials[request.context.command_id] == "EXTERNAL_ENCODER_POSITION_UNSUPPORTED"
+        assert node._denials[request.context.command_id] == "CONTROL_MODE_MISMATCH"
         baseline = GcaState(
             boot_id="freeze",
             state_seq=9,

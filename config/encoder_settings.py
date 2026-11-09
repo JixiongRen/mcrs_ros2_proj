@@ -133,6 +133,11 @@ def settings_payload():
                 f"n{counts_per_revolution}-s{direction_sign:+d}-v1"
             ),
         },
+        "estimation": {
+            # 位置模式的有限速度窗口，单位 s；位置仍随每个新样本更新。
+            # 用展开后位移差/实际时间差，窗口未形成时速度无效；不改变手柄模式。
+            "velocity_window_s": 0.2,
+        },
         "acquisition": {
             # 初值 20 ms（50 Hz）：独立只读短测 100 次成功，无漏周期。
             # 实测事务中位数 8.03 ms、最大 13.25 ms，详见上方短时测时报告。

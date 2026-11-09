@@ -76,12 +76,12 @@ def stop_from_core(state):
     msg = StopStatus()
     msg.progress = state.stop_progress
     msg.reason = state.error_code or state.message
-    servo_only = isinstance(state, FeedRuntimeState)
-    msg.linear_confirmed = not servo_only and state.stop_progress == "CONFIRMED"
-    msg.rotation_confirmed = (
-        not servo_only and state.stop_progress == "CONFIRMED" and state.engine_idle
-    )
-    msg.servo_confirmed = servo_only and state.stop_progress == "CONFIRMED"
+    if isinstance(state, FeedRuntimeState):
+        msg.linear_confirmed = state.linear_stop_confirmed
+        msg.servo_confirmed = state.servo_stop_confirmed
+    else:
+        msg.linear_confirmed = state.stop_progress == "CONFIRMED"
+        msg.rotation_confirmed = state.stop_progress == "CONFIRMED" and state.engine_idle
     msg.evidence_kind = state.stop_evidence
     return msg
 
