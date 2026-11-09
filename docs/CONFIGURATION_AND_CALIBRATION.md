@@ -36,7 +36,222 @@ python3 config/servo_settings.py export artifacts/servo_config/hardware.json \
 
 v3快照修正了原150毫秒预算无法覆盖完整WRITE/ACK、READ及控制周期的问题。`joydev_hold`使用配置的300毫秒观察期限，既有样本及许可的截止时间不续期；LT/B独立STOP不等待该期限。原双轴profile与默认`qualified_state`的更严格输入约束保留。旧v2 JSON需重新导出，不接受不满足新预算校验的快照。
 
-纯舵机不使用下文双轴 `mm_per_revolution`、编码器比例、PID 或脉冲字段。未来每转推进量与机械方向均须独立实测；舵机轴角不能替代外部位移反馈。完整启动、只读工具和记录说明见[舵机指南](SERVO_USER_GUIDE.md)。下文继续描述原双轴 YAML 配置。
+纯舵机不使用下文双轴 `mm_per_revolution`、编码器比例、PID 或脉冲字段。位移草稿中的舵机比例按用户确认的几何关系计算，尚无独立位移测量验证；舵机轴角不能替代外部位移反馈。完整启动、只读工具和记录说明见[舵机指南](SERVO_USER_GUIDE.md)。
+
+## 上位机位移闭环参数草稿
+
+两个独立配置入口负责准备后续位移闭环所需参数：[`config/servo_settings.py`](../config/servo_settings.py) 的 `position_settings_payload()` 保存舵机机械映射、PID 和运动限制；[`config/encoder_settings.py`](../config/encoder_settings.py) 的 `settings_payload()` 保存编码器通信记录、计数格式、机械映射和采集参数。它们只使用 Python 标准库，显示和导出不需要 ROS，不连接设备。
+
+```bash
+python3 config/servo_settings.py show --section position
+python3 config/servo_settings.py export artifacts/position_config/servo.json --section position
+python3 config/encoder_settings.py show
+python3 config/encoder_settings.py export artifacts/position_config/encoder.json
+```
+
+修改源脚本中的值，再重新导出；JSON 不作为第二个手工配置来源。两个草稿分别带有 `kind="servo_position_draft"` 和 `kind="encoder_position_draft"`，**不能传入当前 `servo_config_file` 或当作原双轴设备配置使用**。舵机脚本省略 `--section` 时仍导出现有运行快照，`--backend` 与 `--manual-input-mode` 只作用于该运行区。草稿显示和导出仅用于保存参数，不表示这些参数已完成标定或通过运行配置校验。
+
+当前手柄路径仍使用原生 RPM 控制，不读取上述草稿，不依赖外部编码器。上位机位移 PID 尚未启用；运行快照中的 `mechanical_mapping`、`position_pid` 仍须为 `null`。下列 TODO 即使全部填完，也不会自动打开位置控制能力。
+
+### 舵机参数与待确认项
+
+以下路径均相对于 `position_settings_payload()` 返回值。用户已确认驱动轮半径 6 mm、输出轴直驱，并将现有摇杆上推的转向定义为推进正方向；该转向对应舵机负 RPM，所以位置转换系数为 `-1`。PID 已填入待实验调整的初值；`motion` 按用户指定填写，仅刹车减速度与刹车延迟保留 `None`（导出为 `null`）及 TODO。位置零点和参考标识由后续运行时建立，不把某次原始读数写成固定零点。
+
+| 字段路径 | 当前值 | 单位 | 含义 |
+|---|---|---|---|
+| `mechanics.drive_wheel_radius_mm` | 6.0 | mm | 用户确认的驱动轮有效半径 |
+| `mechanics.shaft_revolutions_per_wheel_revolution` | 1.0 | 舵机输出轴圈/驱动轮圈 | 直驱，不再计入舵机内部减速比 |
+| `mechanics.mm_per_shaft_revolution` | `2π × 6 / 1 ≈ 37.6991` | mm/舵机输出轴圈 | 按无滑动前提计算，随半径和传动比更新；不是独立实测结果 |
+| `mechanics.direction_sign` | −1 | +1 或 −1 | 正向推进转换为负 RPM，保持当前手柄上推方向 |
+| `mechanics.calibration_id` | `geometry-r6mm-direct-v1` | 文本 | 当前几何比例及方向约定的版本标识 |
+| `pid.kp` | 2.0 | 1/s | 比例增益初值；1 mm 位置误差产生 2 mm/s 的比例速度请求 |
+| `pid.ki` | 0.0 | 1/s² | 积分暂时关闭，待稳态误差实测后整定 |
+| `pid.kd` | 0.0 | 无量纲 | 测量速度阻尼暂时关闭，先确认测量噪声及延迟 |
+| `pid.kaw` | 2.0 | 1/s | 抗积分饱和跟踪初值；`ki=0` 时不起作用 |
+| `pid.integral_limit_mm_s` | 1.0 | mm/s | 积分项速度贡献上限初值；当前积分项保持为零 |
+| `pid.dt_max_s` | 0.2 | s | PID 最大相邻有效样本间隔初值，不是期望采样周期 |
+| `motion.linear_min_mm` | −50.0 | mm | 固定零点后方 50 mm；不是每条指令最多后退 50 mm |
+| `motion.linear_max_mm` | 1000.0 | mm | 固定零点前方 1000 mm；多次移动共用这一上限 |
+| `motion.max_linear_mm_s` | 10.0 | mm/s | 推进或后退每秒最多移动 10 mm |
+| `motion.max_linear_mm_s2` | 10.0 | mm/s² | 每秒速度最多变化 10 mm/s；不代表实测刹车能力 |
+| `motion.braking_deceleration_mm_s2` | `None` | mm/s² | 待测减速度；未知时使用下节的显式缺省值 |
+| `motion.braking_delay_s` | `None` | s | 待测完整链路延迟；未知时使用下节的显式缺省值 |
+| `motion.boundary_margin_mm` | 10.0 | mm | 两端各保留 10 mm，用于边界制动计算 |
+| `motion.position_tolerance_mm` | 1.0 | mm | 距最终目标不超过 1 mm，满足到位的位置条件 |
+| `motion.velocity_tolerance_mm_s` | 0.1 | mm/s | 外部编码器测得的推进速度绝对值不超过 0.1 mm/s，满足到位的速度条件 |
+| `motion.settle_s` | 0.3 | s | 位置和速度条件同时连续满足 0.3 秒，且反馈持续有效，才确认到位 |
+
+`calibration_id` 是用于记录和区分参数依据的标签，不是舵机寄存器或 PID 系数，也不参与数值计算。当前标签表示“6 mm 半径、直驱、无滑动几何模型，第 1 版”；它不表示已经通过实测标定。半径、传动关系、方向或标定依据改变时应更新标识，实测后可换成对应测量记录的标识。
+
+PID 参数沿用 `PositionController` 的输出定义：`v_requested = v_ref + kp × (x_ref − x_measured) + I − kd × v_measured`，输出单位为 mm/s。目前从比例控制开始，避免尚未确认的积分累积、速度噪声及延迟影响整定；这组工程初值不是根据实机辨识得到的结果，不保证响应时间、超调或稳态误差。响应速度与稳定裕度需要结合系统响应权衡，参见 [MathWorks PID 整定说明](https://www.mathworks.com/help/control/getstart/pid-tuning-algorithm.html)。`dt_max_s` 在接入时须与编码器采样周期、反馈最大年龄及实际通信延迟一起确认，不能当作采样周期使用。
+
+这些 `motion` 数值是用户指定的控制要求，不是实测性能结论。位置误差满足 1 mm 并不能单独判定任务完成：还需外部编码器测得的线速度绝对值不超过 0.1 mm/s，两个条件持续满足 0.3 秒。速度条件使用实际推进速度，不使用舵机 RPM 或舵机目标速度代替；编码器测量噪声能否支持该阈值仍待确认。`motion.settle_s` 用于位移任务到位判定，与现有运行区用于舵机停车确认的 `settle_s` 分开维护。
+
+按现有 `boundary_velocity` 的计算方式，两端各扣除 10 mm 余量后，向外运动的速度上限在 −40 mm 和 990 mm 处降为零。这里是行程两端预留的距离，不是每条位移指令都少走 10 mm。未来接入时，目标范围校验需要与这段预留范围一致，避免接受边界余量内无法到达的目标。刹车减速度和完整链路延迟仍待测量，本轮不启用位置闭环。
+
+### 刹车实测值未知时的缺省策略
+
+`motion` 中的两项 `None` 继续表示“尚未测得”，不写入估计值冒充实测结果。另在同一脚本的 `braking_defaults` 中集中设置临时计算参数：
+
+| 缺省字段 | 当前值 | 用途与依据 |
+|---|---:|---|
+| `braking_defaults.braking_deceleration_mm_s2` | 5.0 mm/s² | 暂按这一减速能力计算停车距离；比采用指令加速度 10 mm/s² 更早开始减速 |
+| `braking_defaults.braking_delay_s` | 0.5 s | 暂为采样、通信和执行响应预留 0.5 秒；不是实测最坏时延 |
+
+这是明确选择的工程初值，不是已验证的制动能力。每项分别解析：`motion` 中填写了有效数值，就优先使用该数值；仅当它为 `None` 时才采用对应缺省值。原始配置不被覆盖。零延迟是明确提供的零值，不会被当成未知；减速度为零、负延迟或非有限数等错误仍会报错，不用缺省值掩盖错误输入。
+
+`show --section position` 和 `export --section position` 会同时输出 `motion`、`braking_defaults` 及派生的 `effective_braking`，位置草稿版本为 2。当前派生结果如下，不要另行手改：
+
+```json
+"effective_braking": {
+  "deceleration_mm_s2": 5.0,
+  "delay_s": 0.5,
+  "deceleration_source": "default",
+  "delay_source": "default"
+}
+```
+
+`default` 表示采用缺省值，`configured` 表示采用 `motion` 中显式填写的值；来源标签不替代测量验证。缺省策略仍执行边界减速计算和 10 mm 余量限制，不是跳过制动保护。以 10 mm/s 为例，模型计算的延迟行程为 `10 × 0.5 = 5 mm`，减速行程为 `10² ÷ (2 × 5) = 10 mm`，加上边界余量共 25 mm；这个计算不能证明实机必然在该距离内停止。
+
+纯 Python 的 [`resolve_braking_parameters`](../ros2_ws/src/gca_core/gca/domain/position.py) 已实现参数选择、来源记录及可直接用于边界计算的 `ResolvedBraking.limit_velocity()`。显示和导出使用同一解析函数；后续位置运行应使用该解析结果，使这两项未知值不再阻塞制动参数准备。当前 ROS 舵机入口仍只有手柄速度控制，位置闭环尚未接入，不能据此认为位置控制已经可运行。
+
+### 编码器已确认的通信记录
+
+以下为本机已完成的只读采集设置，依据见[接口与读取报告](../artifacts/encoder_readonly/waveshare-b-setup-8uelsbj4/report.json)。这些记录证明当前参数能够取得合法响应，不证明编码器型号、计数回绕或毫米比例已经确认。
+
+| 字段或配置组 | 当前记录 |
+|---|---|
+| `board.model`、`board.connector` | Waveshare RS485 CAN HAT (B)，RS485_1 |
+| `board.driver`、`board.overlay` | `sc16is7xx`；`sc16is752-spi1,int_pin=24` |
+| `board.spi_bus`、`board.chip_select` | SPI1，片选 0 |
+| `board.miso_gpio_bcm`、`board.mosi_gpio_bcm`、`board.sclk_gpio_bcm` | BCM 19、20、21 |
+| `board.chip_select_gpio_bcm`、`board.interrupt_gpio_bcm`、`board.crystal_hz` | BCM 18、24；14745600 Hz |
+| `communication.interface`、`communication.protocol` | RS485，Modbus RTU |
+| `communication.port`、`communication.baudrate` | `/dev/ttySC1`，38400 baud |
+| `communication.bytesize`、`communication.parity`、`communication.stopbits` | 8、N、1 |
+| `communication.address`、`communication.function_code` | 地址 1，功能码 3（读保持寄存器） |
+| `communication.register_start`、`communication.register_count` | 从寄存器 0 开始读取 2 个寄存器 |
+| `count_format.byte_order_in_register` | `big`，单个 16 位寄存器内部高字节在前；两个寄存器的排列顺序见下节 |
+
+`board` 中的引脚均为 BCM 编号。该配置区仅记录已经安装的扩展板及设备树参数，脚本不会据此修改 GPIO、加载驱动或改写启动配置。当前舵机使用 USB 转串口，因此舵机运行脚本没有 GPIO 控制引脚。
+
+### 编码器规格与计数格式
+
+用户于 2026-11-09 提供了购买记录和机构尺寸：布瑞特磁电断电记忆编码器，购买接口为 RS485，多圈量程 1800 圈，单圈分辨率 12 bit；测量轮接触半径为 10.89 mm，直连编码器轴。随后提供了该设备的 V2.7 官方手册，并明确正向推进时编码器计数应增加。编码器草稿已更新为版本 3。购买名称中的 SSI、CAN 是名称文字，不据此认定当前设备同时支持这些接口；完整型号已由用户确认为 `BRT38-ROM-4096-D1800-RT1-IP68`。
+
+| 字段路径 | 当前值 | 含义与依据 |
+|---|---|---|
+| `device.brand`、`device.purchase_description` | 布瑞特；保留用户提供的购买名称 | 硬件来源记录，不冒充具体型号 |
+| `device.model` | `BRT38-ROM-4096-D1800-RT1-IP68` | 用户提供的完整型号，按原文记录 |
+| `device.manual_version` | `V2.7` | 用户提供的官方手册版本 |
+| `device.single_turn_resolution_bits` | 12 | 每圈分成 `2¹²` 份，来自购买规格 |
+| `device.multi_turn_range_revolutions` | 1800 | 多圈测量量程，单位为编码器轴圈；不是每圈计数 |
+| `communication.mode` | `query` | 主站发送一次查询，接收一次响应；对应手册模式 0，脚本不写设备模式寄存器 |
+| `communication.crc_byte_order` | `little` | CRC 校验的低字节先发送，与计数数据的字节顺序不同 |
+| `count_format.bits` | 32 bit | 两个 16 位寄存器组成总计数，不是每圈分辨率 |
+| `count_format.counts_per_revolution` | 4096 count/圈 | 由 12 bit 计算，与厂家说明一致 |
+| `count_format.word_order` | `high_word_first` | 先收到高 16 位，再收到低 16 位 |
+| `count_format.signed` | `False` | 原始计数为无符号整数；反转仍可使读数减少 |
+| `count_format.min_count`、`count_format.max_count` | 0、7,372,799 count | 包含两端的有效计数范围，上限由分辨率和圈数计算 |
+| `count_format.count_modulus` | 7,372,800 count | 本轮按用户指定采用 1800 圈循环；未做跨越端点的实测 |
+| `mechanics.measurement_wheel_radius_mm` | 10.89 mm | 用户确认的测量轮接触半径 |
+| `mechanics.encoder_revolutions_per_wheel_revolution` | 1.0 | 测量轮一圈对应编码器轴一圈，用户确认直连 |
+| `mechanics.direction_sign` | +1 | 按用户约定，正向推进时计数增加；这是软件位移换算系数 |
+| `mechanics.mm_per_count` | 约 0.01670505 mm/count | 按用户选择，直接由轮径、传动比和分辨率计算理论比例 |
+| `mechanics.calibration_id` | `geometry-r10.89mm-g1-n4096-s+1-v1` | 自动记录当前几何参数及方向，不表示实测标定通过 |
+
+本节以用户提供的[布瑞特《RS485 通信协议多圈 V2.7》](<prebuild_docs/3764672290002 RS485说明书通信协议 多圈 V2.7.pdf>)为依据，替代此前查阅的 V2.3。下文页码采用正文印刷页码，PDF 页码比正文多 2 页。正文第 1～2 页列出 12 bit 对应 4096；第 7 页第 5.4.1.1 节说明寄存器 `0x0000～0x0001` 为无符号编码器总计数，示例 `00 01 76 3B` 对应 95803，明确高位在前。该节适用于所有多圈编码器，查询帧与本机已成功使用的 `01 03 00 00 00 02 C4 0B` 一致。
+
+按同节的范围公式及购买规格，标称计数范围为 `0～1800 × 4096 − 1`，即 `0～7,372,799`，已写入 `min_count`、`max_count`。本轮按用户指定将 `count_modulus` 设为 `1800 × 4096 = 7,372,800`，随圈数及分辨率计算；采用循环规则的依据是用户本轮指定，不宣称 V2.7 明确说明了端点行为或已经完成跨界实测。32 位存储空间不表示应按 `2³²` 回绕。量程上限很大也不意味着回绕不会出现：靠近原始零点时反向移动，同样可能越过下端。
+
+`device.model` 已按用户提供的信息填写为 `BRT38-ROM-4096-D1800-RT1-IP68`；其中的 4096、D1800 与现有每圈计数和多圈量程配置一致。型号来源是用户确认，不是套用手册中的通用命名示例。
+
+`mechanics.direction_sign=+1` 表示软件把正计数变化换算成正推进位移。它不会让硬件自动改变计数方向，也不是手册第 5.4.9 节的寄存器取值：硬件寄存器 `0x0009` 的 `0/1` 分别表示从输出轴端观察时顺时针/逆时针递增。现有信息没有规定实际安装后的轴端观察方向，因此不把软件 `+1` 直接写入该寄存器。方向约定来自用户，本次没有追加运动验证。
+
+### V2.7 手册中的通信与测速参数
+
+| 手册内容 | 已确认的信息 | 对当前配置的作用 |
+|---|---|---|
+| 第 5.1、5.4.5 节：串口 | 8N1，出厂默认 9600 baud，可设置 38400 baud | 保留本机已成功读取的 38400，不恢复出厂速率 |
+| 第 5.4.6 节：工作模式 | `0` 查询、`1` 自动回传计数、`5` 自动回传测速值 | 当前采集方式记为 `query`；模式寄存器标为仅写，这不是本次读回值 |
+| 第 5.4.2、5.4.3 节：圈数和单圈值 | `0x0002` 为圈数，`0x0003` 为单圈值 | 当前规格分别为 `0～1799`、`0～4095`；位移读取仍使用总计数寄存器，无需拆成两次查询 |
+| 第 2 页：内核刷新周期 | 50 μs | 设备内部刷新间隔，不能当作树莓派串口读取周期 |
+| 第 5.4.7 节：自动回传周期 | 默认 50 ms；小于 20 ms 时修改其他参数容易失败 | 只适用于自动回传模式，不据此填写查询模式的 `sample_period_s` |
+| 第 5.4.10 节：内部角速度采样时间 | `0x000A`，默认 100 ms，可配置，标为仅写 | 测速的统计时间窗，不是通信超时或位置读取周期，也不代表当前设备实值已知 |
+| 第 5.4.14 节：角速度值 | `0x0020～0x0021`，32 位有符号整数 | 与无符号总计数分开解析；当前配置仍只读取位置，不启用这条测速路径 |
+
+若后续使用厂家测速寄存器，设其有符号返回值为 `q`、实际配置的测速时间窗为 `T_s` 秒，则 `rpm = 60 × q / (4096 × T_s)`。返回值不是直接的 RPM，不能忽略时间窗，也不能把默认 100 ms 当成已读回的实际设置。V2.7 的无符号“角速度值 2.1”条目使用重叠地址且适用范围写为单圈编码器，不能据此替换本机的多圈位置或有符号测速接口。
+
+手册帧格式表将 CRC 标成高字节在前，但示例帧和已有实机响应均是低字节在前：查询正文 `01 03 00 00 00 02` 算得 CRC 为 `0x0BC4`，发送顺序是 `C4 0B`。配置记录为 `crc_byte_order="little"`，现有协议实现无需修改。CRC 字节顺序和计数数据的高位在前是两回事。
+
+### 编码器采集初值与限速联动
+
+| 字段路径 | 当前值 | 设置依据及适用条件 |
+|---|---|---|
+| `acquisition.sample_period_s` | 0.02 s，即 50 Hz | 本轮约 2 秒、100 次独立查询成功，20 ms 查询节拍无漏周期 |
+| `acquisition.transaction_timeout_s` | 0.05 s | 相对本次最大响应耗时 13.25 ms 留出余量；完整有效回复到达即返回 |
+| `acquisition.feedback_max_age_s` | 0.1 s | 用户指定的初值；原采样时刻起超过 100 ms 的数据不再用于控制 |
+| `acquisition.quiet_s` | 0.1 s | 用户指定的打开/重连静默等待初值；不是每次查询前等待 100 ms |
+| `acquisition.max_speed_mm_s` | 15.0 mm/s，自动派生 | 舵机位移控制限速的 1.5 倍；50% 余量为工程初值，容纳瞬态与测量波动 |
+
+`feedback_max_age_s=0.1` 可以作为初始设置，但它不能独立于读取周期判断：正常读取间隔加上通信、调度延迟须小于 0.1 秒，否则会反复把反馈判为过期。因此旧测试采用的 0.2 秒读取间隔不能直接用于这组配置。以当前 10 mm/s 指令上限计算，100 ms 对应 1 mm 行程，已相当于到位位置容差；这个数值是反馈失效的时间界限，不保证位置控制精度，也不表示应每 100 ms 才更新一次位置。
+
+本轮仅进行一次不使用 ROS2 的短时读取，使用现有 `SerialEncoder` 适配器，在 `/dev/ttySC1`、38400 baud、8N1、地址 1 上发送功能码 03 查询。100 次全部得到合法响应，失败 0 次，漏周期 0 次；实际采样约 1.988 秒，含打开、静默等待和关闭共约 2.103 秒。[原始报告](../artifacts/encoder_readonly/timing-7x7x_4_p/report.json)及[逐次记录](../artifacts/encoder_readonly/timing-7x7x_4_p/samples.jsonl)保留在项目中。耗时从查询开始计至完整响应通过 CRC 校验，不包含打开串口、静默等待或周期休眠。
+
+| 本轮测量项 | 结果 |
+|---|---:|
+| 单次查询最小耗时 | 7.23 ms |
+| 单次查询中位数 | 8.03 ms |
+| 单次查询 P95 | 10.62 ms |
+| 单次查询最大耗时 | 13.25 ms |
+| 查询发起间隔最大值 | 20.10 ms |
+| 有效反馈接收间隔最大值 | 25.54 ms |
+
+因此读取周期初值采用已在本轮运行的 20 ms；查询超时初值采用 50 ms，约为本次最大耗时的 3.77 倍。正常响应无需等待到超时，仍可按 20 ms 周期查询；若单次响应超过一个周期，则不重叠发起查询，也不密集补发错过的周期。`20 ms + 50 ms < 100 ms` 为现有反馈有效期留出 30 ms 预算，但这不是实际调度延迟的保证。此次采集使用 80 ms 的探测超时，所有实际响应均在 13.25 ms 内完成；50 ms 是依据结果选出的初值，没有为此另开一轮实机测试。短测没有覆盖长期负载、通信故障或 ROS 调度，不把本次最大值当作最坏耗时保证。
+
+`quiet_s=0.1` 可以暂作工程初值。打开或重连时，持续 100 ms 没有收到旧数据才开始查询；期间收到数据则重新计算静默时间。它和反馈有效期用途不同，只是本轮都选用了 0.1 秒，并未在代码中互相引用。手册未给出最晚回复延迟，现有记录也未验证这一延迟小于 100 ms，因此仍保留该项验证 TODO，但不将配置值留空。
+
+编码器脚本通过标准库 `run_path` 读取同目录 `servo_settings.py` 的 `position_settings_payload()`，计算 `acquisition.max_speed_mm_s = 1.5 × motion.max_linear_mm_s`。当前为 `1.5 × 10 = 15 mm/s`；修改舵机位移限速后，重新显示或导出编码器配置就会自动更新，无需两处手工修改。系数 `speed_plausibility_factor=1.5` 集中在编码器脚本中，属于待实际噪声和响应记录检验的初值，不是厂家参数。配置源缺失会直接报错，不使用隐含缺省值。
+
+15 mm/s 是未来位移闭环的读数合理性阈值，不会把运动指令上限从 10 mm/s 提高到 15 mm/s。它也不使用手柄模式的原生 RPM 上限计算：手柄控制仍不受外部编码器调节。现有估计器的跳变检查还包含两个计数的量化余量，因此这个阈值不是要求每个瞬时速度计算值都严格不超过 15 mm/s。
+
+### 编码器参数填写状态
+
+编码器 `settings_payload()` 返回的配置中已没有 `None` 字段。部分已填写参数另保留工程验证说明，不把“已填写”与“已实测”混为一项。
+
+`None` 表示尚未确认，不能用 0 或 `False` 代替。计数有无符号、计数回绕周期、推进方向是三项不同信息；禁止由其中一项推断另外两项。寄存器返回四字节也不等于每圈有 2³² 个计数。
+
+单个寄存器内部的字节顺序已按 [Modbus 规范第 4.2 节](https://www.modbus.org/file/secure/modbusprotocolspecification.pdf)填写为 `big`。两个寄存器怎样组成一个计数，则依据上述厂家手册填写为 `high_word_first`；这两项分别规定字节顺序和寄存器顺序。
+
+购买规格和厂家说明已支持额定值 4096 count/圈。[一次手动单圈粗测](../artifacts/encoder_readonly/one-turn-w2m1v9vq/assessment.json)得到 4063，较额定值少约 0.81%；没有独立角度参考，该差异不用于修改额定分辨率，也不代表完成了精度标定。旧代码中的编码器轮半径约 10.9783 mm 不再沿用，当前采用用户明确提供的 10.89 mm；1800 圈量程已由购买规格确认，但仍与回绕行为分开记录。
+
+已有两段连续采集共 1221 个有效样本，读取均未报错。两段原始记录的相邻接收间隔中位数分别约为 0.20058 s、0.20060 s，最大值约为 0.20554 s、0.20575 s。这说明目标 0.2 s 的采集周期可以工作，但不能直接作为当前闭环的配置：实际间隔既超过本轮设置的 0.1 s 反馈有效期，也会超过草稿中的 `pid.dt_max_s=0.2 s`。在 10 mm/s 时，0.2 s 间隔对应约 2 mm 行程，也不能单凭采集成功宣称已支持 1 mm 到位要求。原始记录见[手转采集](../artifacts/encoder_readonly/manual-rotation-bb7vmi19/samples.jsonl)及[单圈采集](../artifacts/encoder_readonly/one-turn-w2m1v9vq/samples.jsonl)。
+
+[历史单次查询](../artifacts/encoder_readonly/waveshare-b-setup-8uelsbj4/read-001/report.json)约 0.0093 s 收到完整响应，只证明该次响应耗时。旧采集器的 1 s 是预设等待上限，不是测得的最坏耗时。本轮已根据上节的短时测量将 `transaction_timeout_s` 设为 0.05 s。V2.7 没有给出查询响应的最坏耗时，短测也没有覆盖迟到回复，因此 `quiet_s=0.1 s` 仍是用户指定的工程初值。手册中的最大机械转速 3000 RPM 是编码器自身的额定机械上限，本机构的读数异常阈值采用上节的位移限速及余量计算。
+
+品牌、完整型号、额定规格、测量轮尺寸、传动关系和正向计数约定已获得，不需要重复提供。毫米比例采用用户选择的理论值，循环周期采用用户指定值；软件已为这组几何比例生成 `calibration_id`。读取周期和单次查询超时已依据本轮短测填入初值。
+
+### 几何换算与实测标定的职责
+
+舵机侧令 `R_s = mechanics.drive_wheel_radius_mm`、`G_s = mechanics.shaft_revolutions_per_wheel_revolution`，理想无滑移时的几何推进量为：
+
+\[
+c_{geometry}=\frac{2\pi R_s}{G_s}\quad[\mathrm{mm/舵机输出轴圈}]
+\]
+
+编码器侧令 `R_e = mechanics.measurement_wheel_radius_mm`、`G_e = mechanics.encoder_revolutions_per_wheel_revolution`、`N_e = count_format.counts_per_revolution`，理想几何比例为：
+
+\[
+k_{geometry}=\frac{2\pi R_e}{G_e N_e}\quad[\mathrm{mm/count}]
+\]
+
+代入当前编码器参数，测量轮一圈的理论行程为 `2π × 10.89 ≈ 68.42389 mm`，每个计数对应 `68.42389 / 4096 ≈ 0.01670505 mm`，即约 16.705 μm。按用户本轮选择，`mechanics.mm_per_count` 直接采用该计算结果；它随轮径、传动比和分辨率自动更新，不另行手工填写小数。这是无滑动、有效半径不变时的几何换算，不是实测位移精度。
+
+两个传动比都是“轴转数 / 对应轮转数”，不能颠倒。按用户明确选择，舵机的 `mm_per_shaft_revolution` 与编码器的 `mm_per_count` 均直接采用无滑动几何模型，避免手工维护重复数值；轮面形变或滑动会使实际推进量偏离该模型。编码器的 `calibration_id` 包含半径、轴/轮传动比、每圈计数和方向，并以 `geometry` 标明理论来源。若进行独立实测标定，两项比例应分别依据舵机输出轴转数与独立位移、编码器连续计数与独立位移，不能用舵机目标值给编码器标定，再用该编码器结果反证舵机比例。
+
+未来位置路径使用比例正值 `c = servo.mechanics.mm_per_shaft_revolution` 将 PID 线速度换为舵机 RPM：`rpm = servo.mechanics.direction_sign × 60 × velocity_mm_s / c`。当前 `c` 是几何计算值，不是位移测量结果。编码器完成经确认的计数解析与回绕展开后，用 `Δx = encoder.mechanics.direction_sign × encoder.mechanics.mm_per_count × Δcount` 得到测量位移。两处方向分别对应执行器和传感器，不重复叠加手柄的方向系数。
+
+位置参考必须在运行时根据新鲜有效反馈建立；当前寄存器值、某次试验初始值和设备硬件零位都不能自动充当任务坐标零点。后文继续描述原双轴 YAML 配置，不应将其中的仿真默认值直接填入上述草稿。
 
 ## 文件结构、加载与单位
 

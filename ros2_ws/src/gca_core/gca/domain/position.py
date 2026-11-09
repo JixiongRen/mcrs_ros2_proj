@@ -10,7 +10,49 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Protocol
 
-from gca.algorithms.control import ControllerOutput
+from gca.algorithms.control import ControllerOutput, boundary_velocity
+
+
+@dataclass(frozen=True)
+class ResolvedBraking:
+    """Effective braking assumptions and their source, not measurement evidence."""
+
+    deceleration_mm_s2: float
+    delay_s: float
+    deceleration_source: str
+    delay_source: str
+
+    def limit_velocity(self, value, position, low, high, margin=0.0):
+        return boundary_velocity(
+            value, position, low, high, self.deceleration_mm_s2, self.delay_s, margin
+        )
+
+
+def resolve_braking_parameters(motion, defaults) -> ResolvedBraking:
+    """Use explicitly configured defaults only for the two unknown (None) values.
+
+    Never changes the measured-value placeholders. Invalid supplied values are
+    errors, not a reason to silently select defaults. The caller uses this same
+    result for boundary calculation and recording its parameter provenance.
+    """
+    values, sources = {}, {}
+    for name in ("braking_deceleration_mm_s2", "braking_delay_s"):
+        value = motion[name]
+        use_default = value is None
+        if use_default:
+            value = defaults[name]
+        if type(value) not in (int, float) or not isfinite(value):
+            raise ValueError(f"{name} must resolve to a finite number")
+        if value < 0 or (name == "braking_deceleration_mm_s2" and value == 0):
+            raise ValueError(f"{name} outside its positive/nonnegative range")
+        values[name] = float(value)
+        sources[name] = "default" if use_default else "configured"
+    return ResolvedBraking(
+        values["braking_deceleration_mm_s2"],
+        values["braking_delay_s"],
+        sources["braking_deceleration_mm_s2"],
+        sources["braking_delay_s"],
+    )
 
 
 @dataclass(frozen=True)

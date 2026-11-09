@@ -116,11 +116,15 @@ python3 config/servo_settings.py export artifacts/servo_config/hardware.json \
   --backend hardware --manual-input-mode joydev_hold
 ```
 
-JSON 是带版本与 SHA-256 摘要的生成快照，不另行手改。硬件和模拟快照的 `backend` 不同，不能互换。舵机节点、协调器和手柄节点必须加载**同一路径、同一内容**；标准launch将 `servo_config_file` 同时传给这三个节点。能力响应的配置摘要、后端或速度上限不匹配时，手柄拒绝 ARM。
+以上命令使用默认 `--section runtime`，JSON 是带版本与 SHA-256 摘要的运行快照，不另行手改。硬件和模拟快照的 `backend` 不同，不能互换。舵机节点、协调器和手柄节点必须加载**同一路径、同一内容**；标准launch将 `servo_config_file` 同时传给这三个节点。能力响应的配置摘要、后端或速度上限不匹配时，手柄拒绝 ARM。
+
+后续上位机位移闭环所需的驱动轮半径、传动比、PID 及运动限制，在同一脚本的 `position_settings_payload()` 中集中定义，可用 `python3 config/servo_settings.py show --section position` 查看。外部编码器参数另由 `python3 config/encoder_settings.py show` 查看。未知值保留 `None` 和 TODO；完整字段、单位、导出命令与标定关系见[上位机位移闭环参数草稿](CONFIGURATION_AND_CALIBRATION.md#上位机位移闭环参数草稿)。这两份草稿不能作为当前 `servo_config_file`，填写或导出不会启用 PID，也不会改变手柄控制。
+
+刹车减速度与延迟为 `None` 时，参数解析分别采用 `braking_defaults` 中的 `5 mm/s²`、`0.5 s`；显示和导出的 `effective_braking` 会标明使用值及来源。填写实测值后自动优先使用该项实测值，原始 TODO 不会被缺省值覆盖。具体规则见[刹车实测值未知时的缺省策略](CONFIGURATION_AND_CALIBRATION.md#刹车实测值未知时的缺省策略)，当前手柄运行不受这两项 TODO 影响。
 
 `joydev_hold`的reader观察期限由舵机快照中的`manual_input_max_age_s`决定，当前为0.30秒；原profile中的`event_age`期限仍用于原事件模式，不用于连续观察。`qualified_state`仍服从profile与舵机配置中更短的期限。每条观察保留原始截止时间，不在转发时续期，也不限制持续按住LT的总时间。`joydev_hold`调度按`control_period_s`运行，并服从profile更低的发送频率上限；默认40毫秒一次。
 
-当前脚本中的指令上限raw349对应79.921 rpm，不超过用户规定的80 rpm；变化率40 rpm/s、固件加速度raw12、事务期限 0.08 s、反馈年龄 0.25 s、输出期限 0.30 s、停止确认期限 2 s、watchdog raw 25 等是当前空载联调参数，不代表所有失效场景的安全边界已经测定。`manual_axis_to_servo_sign=-1` 表示映射后 LY 上正下负到舵机方向的唯一转换；当前配置校验不接受改为正号。未来机械方向、每转推进量和 PID 尚未标定，`mechanical_mapping`、`position_pid` 必须保持 `null`。
+当前脚本中的指令上限raw349对应79.921 rpm，不超过用户规定的80 rpm；变化率40 rpm/s、固件加速度raw12、事务期限 0.08 s、反馈年龄 0.25 s、输出期限 0.30 s、停止确认期限 2 s、watchdog raw 25 等是当前空载联调参数，不代表所有失效场景的安全边界已经测定。`manual_axis_to_servo_sign=-1` 表示映射后 LY 上正下负到舵机方向的唯一转换；当前配置校验不接受改为正号。位移草稿已按用户确认填写 6 mm 半径、直驱、上推为推进正方向及 PID 初值，每转推进量按无滑动几何模型计算约为 37.6991 mm；这不是实测标定，也尚未接入闭环。当前运行快照中的 `mechanical_mapping`、`position_pid` 必须保持 `null`。
 
 加速度raw12约为42.92 rpm/s，依据[ROBOTIS Profile Acceleration定义](https://emanual.robotis.com/docs/en/dxl/x/xm430-w350/#profile-acceleration108)。软件目标从零达到79.921 rpm约需2秒；这是限速器计算值，不是实测响应时间。厂家标称XM430-W350的空载转速为12 V时46 rpm、14.8 V时57 rpm；指令上限80 rpm不能提高电机本身的速度能力。一次速度写入与反馈读取分别使用80毫秒事务预算，I/O周期20毫秒按整轮计算，事务已超过周期时不追加等待。配置校验要求完整读写周期与控制周期能容纳于输出及输入期限。
 
