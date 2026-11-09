@@ -2,7 +2,7 @@
 
 独立位移测量可用离线工具处理：`source tools/common.sh` 后执行 `"$GCA_PYTHON" tools/calibrate_from_measurements.py --input measurements.csv --output artifacts/calibration`。CSV列为 `count_start,count_end,measured_displacement_mm`，推进位移为正、退出为负，必须来自独立仪器而非目标值。工具拟合有符号比例、正反行程统计和残差，只写报告，不连接设备、不自动修改配置或verified。计数跨回绕时应先依据已核实规则整理连续计数；不能直接拿跨epoch的差值拟合。
 
-原双轴配置源码是 `gca/config.py` 的 `RuntimeConfig` 及 `gca/devices/common.py` 的三个设备配置类；正式设备装配在 `gca/devices/factory.py`。仅舵机入口另使用下节的独立 Python 配置与 JSON 快照，不要求外部编码器或步进设备。
+原双轴配置源码是 `gca/config.py` 的 `RuntimeConfig` 及 `gca/devices/common.py` 的三个设备配置类；正式设备装配在 `gca/devices/factory.py`。当前推进舵机入口使用下节的独立 Python 配置与 JSON 快照：manual 不要求外部编码器或步进设备，position 装配独立外部编码器。
 
 当前默认入口是仿真模型。**原双轴硬件模板没有可直接运行的物理默认值**：`system_bringup/config/hardware.template.yaml` 中的null和false故意使configure/ARM失败。安装依赖、打开串口或手动翻转verified标志均不等于接线、标定或HIL通过。
 
@@ -30,17 +30,17 @@ python3 config/servo_settings.py export artifacts/servo_config/hardware.json \
 | 加速度 | `max_acceleration_rpm_s=40.0`、`profile_acceleration_raw=12` | 当前空载联调参数，分别约束软件目标与设备响应，不代表已测得机械加速度边界 |
 | 周期与期限 | 控制 0.04 s、I/O整轮目标周期 0.02 s、单事务 0.08 s、反馈年龄 0.25 s、输出和held观察 0.30 s、停止确认 2 s | 各自用途不同；校验预算关系不等于测得最坏时延 |
 | 停止与总线保护 | `settle_s=0.10`、`velocity_tolerance_rpm=0.229`、`watchdog_raw=25` | LT/B 停车已有空载证据；两项专项失效测试后移，状态读取也能维持 watchdog |
-| 后续位移闭环 | `mechanical_mapping=null`、`position_pid=null` | 当前schema明确不接受已启用的位置控制配置 |
+| 位移闭环配置 | 旧字段 `mechanical_mapping=null`、`position_pid=null` 保留兼容 | schema 3 使用嵌套 `position`；manual 为 `null`，position 模式必须提供完整参数 |
 
 历史[只读报告](../artifacts/servo_ros2/implementation-xce7i_e4/readonly/report.json)未写寄存器，实际读回模式 4、Goal Velocity 1023、watchdog 0，与候选快照不同是正常现象。当前真实入口configure会关闭力矩、按需切换模式1、读回限制并确认零目标。BFM映射模式已确认；本轮空载连续控制采用显式`joydev_hold`，无线资格仍未完成。
 
-v3快照修正了原150毫秒预算无法覆盖完整WRITE/ACK、READ及控制周期的问题。`joydev_hold`使用配置的300毫秒观察期限，既有样本及许可的截止时间不续期；LT/B独立STOP不等待该期限。原双轴profile与默认`qualified_state`的更严格输入约束保留。旧v2 JSON需重新导出，不接受不满足新预算校验的快照。
+历史手柄参数修订 v3 修正了原150毫秒预算无法覆盖完整WRITE/ACK、READ及控制周期的问题。`joydev_hold`使用配置的300毫秒观察期限，既有样本及许可的截止时间不续期；LT/B独立STOP不等待该期限。原双轴profile与默认`qualified_state`的更严格输入约束保留。这里的参数修订号不同于下文的 `schema_version=3`；不满足现有预算校验的旧 JSON 仍须重新导出。
 
 纯舵机不使用下文双轴 `mm_per_revolution`、编码器比例、PID 或脉冲字段。位移草稿中的舵机比例按用户确认的几何关系计算，尚无独立位移测量验证；舵机轴角不能替代外部位移反馈。完整启动、只读工具和记录说明见[舵机指南](SERVO_USER_GUIDE.md)。
 
 ## 上位机位移闭环参数草稿
 
-两个独立配置入口负责准备后续位移闭环所需参数：[`config/servo_settings.py`](../config/servo_settings.py) 的 `position_settings_payload()` 保存舵机机械映射、PID 和运动限制；[`config/encoder_settings.py`](../config/encoder_settings.py) 的 `settings_payload()` 保存编码器通信记录、计数格式、机械映射和采集参数。它们只使用 Python 标准库，显示和导出不需要 ROS，不连接设备。
+两个独立配置入口提供位移闭环参数：[`config/servo_settings.py`](../config/servo_settings.py) 的 `position_settings_payload()` 保存舵机机械映射、PID 和运动限制；[`config/encoder_settings.py`](../config/encoder_settings.py) 的 `settings_payload()` 保存编码器通信记录、计数格式、机械映射和采集参数。它们只使用 Python 标准库，显示和导出不需要 ROS，不连接设备。
 
 ```bash
 python3 config/servo_settings.py show --section position
@@ -51,11 +51,32 @@ python3 config/encoder_settings.py export artifacts/position_config/encoder.json
 
 修改源脚本中的值，再重新导出；JSON 不作为第二个手工配置来源。两个草稿分别带有 `kind="servo_position_draft"` 和 `kind="encoder_position_draft"`，**不能传入当前 `servo_config_file` 或当作原双轴设备配置使用**。舵机脚本省略 `--section` 时仍导出现有运行快照，`--backend` 与 `--manual-input-mode` 只作用于该运行区。草稿显示和导出仅用于保存参数，不表示这些参数已完成标定或通过运行配置校验。
 
-当前手柄路径仍使用原生 RPM 控制，不读取上述草稿，不依赖外部编码器。上位机位移 PID 尚未启用；运行快照中的 `mechanical_mapping`、`position_pid` 仍须为 `null`。下列 TODO 即使全部填完，也不会自动打开位置控制能力。
+当前手柄路径仍使用原生 RPM 控制，不依赖外部编码器。上位机位移 PID 通过下节的组合快照和显式 position 模式启用，不会因为参数已经填写就自动改变手柄模式。旧兼容字段 `mechanical_mapping`、`position_pid` 仍为 `null`，新位置配置放入 schema 3 的 `position`。
+
+### 组合运行快照
+
+组合导出工具是 [`tools/export_feed_axis_config.py`](../tools/export_feed_axis_config.py)。它只读取上述两个配置源，不连接设备；不要把单独导出的参数草稿直接传入 launch。
+
+```bash
+python3 tools/export_feed_axis_config.py artifacts/position_config/simulation.json \
+  --control-mode position --backend simulation
+python3 tools/export_feed_axis_config.py artifacts/position_config/hardware.json \
+  --control-mode position --backend hardware
+python3 tools/export_feed_axis_config.py artifacts/position_config/manual.json \
+  --control-mode manual --backend simulation --manual-input-mode joydev_hold
+```
+
+schema 3 快照保留舵机运行区，并增加 `control_mode` 和 `position`。`position` 含 `mechanics`、`pid`、`motion`、`braking_defaults`、`effective_braking`、`encoder`。编码器通信、计数、换算、采集和速度窗口参数在运行快照的 `position.encoder` 中展开为明确字段；例如源脚本 `estimation.velocity_window_s` 对应 `position.encoder.velocity_window_s`。引脚与购买记录等不参与控制的元数据仍保留在源脚本，不写入另一套运行常量。
+
+`manual` 快照的 `position=null`；`position` 快照必须包含完整位置参数，缺字段、未知字段、非法值、摘要不符或模式与配置不符均拒绝。执行策略由模式确定为 `MANUAL_SERVO_VELOCITY` 或 `POSITION_EXTERNAL_ENCODER`，不能由普通消息切换。兼容读取的 schema 1/2 快照只表示原有 manual 语义。
+
+统一 `feed_axis.launch.py` 使用 `servo_config_file` 将快照交给设备和协调器；manual 还交给手柄节点。启动时必须显式传入匹配的 `control_mode` 和 `backend`；运行时不执行配置脚本，不能在线改模式或快照路径。使用与切换步骤见[位置用户指南](POSITION_USER_GUIDE.md)，验证结果见[实现状态](POSITION_PID_IMPLEMENTATION_STATUS.md)。
 
 ### 舵机参数与待确认项
 
-以下路径均相对于 `position_settings_payload()` 返回值。用户已确认驱动轮半径 6 mm、输出轴直驱，并将现有摇杆上推的转向定义为推进正方向；该转向对应舵机负 RPM，所以位置转换系数为 `-1`。PID 已填入待实验调整的初值；`motion` 按用户指定填写，仅刹车减速度与刹车延迟保留 `None`（导出为 `null`）及 TODO。位置零点和参考标识由后续运行时建立，不把某次原始读数写成固定零点。
+当前位置模式已有有限实机记录，见[实现状态](POSITION_PID_IMPLEMENTATION_STATUS.md)：100 mm、2 mm/s 推进通过，8 mm/s 回零超调。下列参数仍保留本轮初值，未依据某一次舵机理论行程与编码器位移之比反向修改半径或 PID。软件参考不是配置常量；测量轮脱离导丝后恢复零点的前提见[用户指南](POSITION_USER_GUIDE.md#零点保持与重启后的恢复)。
+
+以下路径均相对于 `position_settings_payload()` 返回值。用户已确认驱动轮半径 6 mm、输出轴直驱，并将现有摇杆上推的转向定义为推进正方向；该转向对应舵机负 RPM，所以位置转换系数为 `-1`。PID 已填入待实验调整的初值；`motion` 按用户指定填写，仅刹车减速度与刹车延迟保留 `None`（导出为 `null`）及 TODO。位置零点和参考标识在运行时显式建立，不把某次原始读数写成固定零点。
 
 | 字段路径 | 当前值 | 单位 | 含义 |
 |---|---|---|---|
@@ -87,7 +108,7 @@ PID 参数沿用 `PositionController` 的输出定义：`v_requested = v_ref + k
 
 这些 `motion` 数值是用户指定的控制要求，不是实测性能结论。位置误差满足 1 mm 并不能单独判定任务完成：还需外部编码器测得的线速度绝对值不超过 0.1 mm/s，两个条件持续满足 0.3 秒。速度条件使用实际推进速度，不使用舵机 RPM 或舵机目标速度代替；编码器测量噪声能否支持该阈值仍待确认。`motion.settle_s` 用于位移任务到位判定，与现有运行区用于舵机停车确认的 `settle_s` 分开维护。
 
-按现有 `boundary_velocity` 的计算方式，两端各扣除 10 mm 余量后，向外运动的速度上限在 −40 mm 和 990 mm 处降为零。这里是行程两端预留的距离，不是每条位移指令都少走 10 mm。未来接入时，目标范围校验需要与这段预留范围一致，避免接受边界余量内无法到达的目标。刹车减速度和完整链路延迟仍待测量，本轮不启用位置闭环。
+按现有 `boundary_velocity` 的计算方式，两端各扣除 10 mm 余量后，向外运动的速度上限在 −40 mm 和 990 mm 处降为零。这里是行程两端预留的距离，不是每条位移指令都少走 10 mm。位置运行时的允许目标范围同为 −40～990 mm，绝对目标和解析后的相对目标均检查这一范围。刹车减速度和完整链路延迟仍待测量，软件采用下节的显式缺省值。
 
 ### 刹车实测值未知时的缺省策略
 
@@ -113,7 +134,7 @@ PID 参数沿用 `PositionController` 的输出定义：`v_requested = v_ref + k
 
 `default` 表示采用缺省值，`configured` 表示采用 `motion` 中显式填写的值；来源标签不替代测量验证。缺省策略仍执行边界减速计算和 10 mm 余量限制，不是跳过制动保护。以 10 mm/s 为例，模型计算的延迟行程为 `10 × 0.5 = 5 mm`，减速行程为 `10² ÷ (2 × 5) = 10 mm`，加上边界余量共 25 mm；这个计算不能证明实机必然在该距离内停止。
 
-纯 Python 的 [`resolve_braking_parameters`](../ros2_ws/src/gca_core/gca/domain/position.py) 已实现参数选择、来源记录及可直接用于边界计算的 `ResolvedBraking.limit_velocity()`。显示和导出使用同一解析函数；后续位置运行应使用该解析结果，使这两项未知值不再阻塞制动参数准备。当前 ROS 舵机入口仍只有手柄速度控制，位置闭环尚未接入，不能据此认为位置控制已经可运行。
+纯 Python 的 [`resolve_braking_parameters`](../ros2_ws/src/gca_core/gca/domain/position.py) 实现参数选择、来源记录及边界计算。显示、组合导出与位置运行采用同一解析结果，这两项 `None` 不阻塞位置软件运行；实际制动能力仍需独立测量，不能把缺省值标为实测。
 
 ### 编码器已确认的通信记录
 
@@ -193,6 +214,9 @@ PID 参数沿用 `PositionController` 的输出定义：`v_requested = v_ref + k
 | `acquisition.feedback_max_age_s` | 0.1 s | 用户指定的初值；原采样时刻起超过 100 ms 的数据不再用于控制 |
 | `acquisition.quiet_s` | 0.1 s | 用户指定的打开/重连静默等待初值；不是每次查询前等待 100 ms |
 | `acquisition.max_speed_mm_s` | 15.0 mm/s，自动派生 | 舵机位移控制限速的 1.5 倍；50% 余量为工程初值，容纳瞬态与测量波动 |
+| `estimation.velocity_window_s` | 0.2 s | 仅位置模式使用：窗口内展开位移差除以实际时间差；不是编码器读取周期 |
+
+位置仍随新样本更新，速度使用约 0.2 秒的有界窗口。单计数约为 0.016705 mm，在 20 ms 差分时相当于 0.835 mm/s，容易把静止时单计数抖动误判为超过 0.1 mm/s；窗口估计降低这种量化影响。参考变化、采样断档、无效样本或连接代次变化会清空窗口，重新积累足够跨度前 `linear_velocity_valid=false`，不能把无效速度当作零速。旧双轴估计默认行为不变，手柄模式不使用这一窗口。
 
 `feedback_max_age_s=0.1` 可以作为初始设置，但它不能独立于读取周期判断：正常读取间隔加上通信、调度延迟须小于 0.1 秒，否则会反复把反馈判为过期。因此旧测试采用的 0.2 秒读取间隔不能直接用于这组配置。以当前 10 mm/s 指令上限计算，100 ms 对应 1 mm 行程，已相当于到位位置容差；这个数值是反馈失效的时间界限，不保证位置控制精度，也不表示应每 100 ms 才更新一次位置。
 
@@ -213,7 +237,7 @@ PID 参数沿用 `PositionController` 的输出定义：`v_requested = v_ref + k
 
 编码器脚本通过标准库 `run_path` 读取同目录 `servo_settings.py` 的 `position_settings_payload()`，计算 `acquisition.max_speed_mm_s = 1.5 × motion.max_linear_mm_s`。当前为 `1.5 × 10 = 15 mm/s`；修改舵机位移限速后，重新显示或导出编码器配置就会自动更新，无需两处手工修改。系数 `speed_plausibility_factor=1.5` 集中在编码器脚本中，属于待实际噪声和响应记录检验的初值，不是厂家参数。配置源缺失会直接报错，不使用隐含缺省值。
 
-15 mm/s 是未来位移闭环的读数合理性阈值，不会把运动指令上限从 10 mm/s 提高到 15 mm/s。它也不使用手柄模式的原生 RPM 上限计算：手柄控制仍不受外部编码器调节。现有估计器的跳变检查还包含两个计数的量化余量，因此这个阈值不是要求每个瞬时速度计算值都严格不超过 15 mm/s。
+15 mm/s 是位移闭环的读数合理性阈值，不会把运动指令上限从 10 mm/s 提高到 15 mm/s。它也不使用手柄模式的原生 RPM 上限计算：手柄控制仍不受外部编码器调节。现有估计器的跳变检查还包含两个计数的量化余量，因此这个阈值不是要求每个瞬时速度计算值都严格不超过 15 mm/s。
 
 ### 编码器参数填写状态
 
@@ -249,7 +273,7 @@ k_{geometry}=\frac{2\pi R_e}{G_e N_e}\quad[\mathrm{mm/count}]
 
 两个传动比都是“轴转数 / 对应轮转数”，不能颠倒。按用户明确选择，舵机的 `mm_per_shaft_revolution` 与编码器的 `mm_per_count` 均直接采用无滑动几何模型，避免手工维护重复数值；轮面形变或滑动会使实际推进量偏离该模型。编码器的 `calibration_id` 包含半径、轴/轮传动比、每圈计数和方向，并以 `geometry` 标明理论来源。若进行独立实测标定，两项比例应分别依据舵机输出轴转数与独立位移、编码器连续计数与独立位移，不能用舵机目标值给编码器标定，再用该编码器结果反证舵机比例。
 
-未来位置路径使用比例正值 `c = servo.mechanics.mm_per_shaft_revolution` 将 PID 线速度换为舵机 RPM：`rpm = servo.mechanics.direction_sign × 60 × velocity_mm_s / c`。当前 `c` 是几何计算值，不是位移测量结果。编码器完成经确认的计数解析与回绕展开后，用 `Δx = encoder.mechanics.direction_sign × encoder.mechanics.mm_per_count × Δcount` 得到测量位移。两处方向分别对应执行器和传感器，不重复叠加手柄的方向系数。
+位置路径使用比例正值 `c = servo.mechanics.mm_per_shaft_revolution` 将 PID 线速度换为舵机 RPM：`rpm = servo.mechanics.direction_sign × 60 × velocity_mm_s / c`。当前 `c` 是几何计算值，不是位移测量结果。编码器完成计数解析与回绕展开后，用 `x = reference_position_mm + encoder.mechanics.direction_sign × encoder.mechanics.mm_per_count × (unwrapped_count − reference_count)` 得到参考坐标下的位置。两处方向分别对应执行器和传感器，不重复叠加手柄的方向系数。
 
 位置参考必须在运行时根据新鲜有效反馈建立；当前寄存器值、某次试验初始值和设备硬件零位都不能自动充当任务坐标零点。后文继续描述原双轴 YAML 配置，不应将其中的仿真默认值直接填入上述草稿。
 

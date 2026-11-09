@@ -4,7 +4,7 @@
 
 正式入口是 ROS 2：客户端 → `system_coordinator` → `gca_control_node` → 本地控制与设备 I/O。当前交付范围为 **GCA-only**。Windows 磁驱动与联合实验编排保留设计边界，没有用 GCA 动作替代磁场／电流控制。
 
-原双轴路径已完成软件模拟验证；新增仅舵机路径已完成空载手柄实机联调，可直接按[真实舵机快速操作](docs/SERVO_USER_GUIDE.md#真实舵机快速操作)使用。手动舵机调速不依赖外部编码器；真实位移闭环、双轴 H01–H03、无线资格及两项后移专项测试尚未完成。各阶段证据见[工程状态与证据](docs/IMPLEMENTATION_STATUS.md)。
+原双轴路径已完成软件模拟验证；手柄舵机路径已完成空载实机联调，可按[真实舵机快速操作](docs/SERVO_USER_GUIDE.md#真实舵机快速操作)使用。上位机指令下发模式已接入外部编码器：100 mm、2 mm/s 推进有通过记录，8 mm/s 回零仍有超调，具体结果见[位移闭环状态](docs/POSITION_PID_IMPLEMENTATION_STATUS.md)。手柄调速保持开环，不读取外部编码器；双轴 H01–H03、无线资格及两项后移专项仍未完成。
 
 ## 无硬件快速运行
 
@@ -16,7 +16,7 @@ bash tools/verify_software.sh
 bash tools/run_simulation_suite.sh --output artifacts/simulation/latest
 ```
 
-`bootstrap` 只准备项目 `.venv`。`verify` 串行构建五个包、运行静态检查和测试，再做独立普通安装与实际 ROS 进程仿真。最后一个入口可单独重复演示；失败返回非零码，报告仍保留。三个入口默认都不访问真实硬件。
+`bootstrap` 只准备项目 `.venv`。`verify` 串行构建八个包、运行静态检查和测试，再做独立普通安装与实际 ROS 进程仿真。最后一个入口可单独演示；失败返回非零码，报告仍保留。三个入口默认都不访问真实硬件。完整验收不是每次文档修改的必跑步骤，局部修改只做必要检查。
 
 查看 `artifacts/verification/latest/report.json` 和 `artifacts/simulation/latest/report.json`。仿真每个场景有客户端结果、原始状态 JSONL／CSV、曲线和 ROS 日志。报告中的 `physical_hil: NOT_RUN` 表示未作实机验收。
 
@@ -50,18 +50,34 @@ python3 tools/joystick_monitor.py
 
 原双轴入口的 `event_age` 模式在静态保持约 0.15 秒后停车；此限制不适用于显式 `joydev_hold` 舵机入口。本机标定文件位于不进入 Git 的 `artifacts/`，新克隆须另行完成映射采集或保留完整的已有标定记录。
 
+## 指令下发模式
+
+通过 `feed_axis.launch.py control_mode:=position` 启动单轴位移闭环，使用 `gca_client position-shell` 发送指令。`move` 指定绝对位置，`relative` 指定相对位移；手柄与指令模式互斥运行。
+
+```text
+relative 100 2 5 120
+```
+
+上述命令表示相对推进 100 mm、速度上限 2 mm/s、加速度上限 5 mm/s²、执行期限 120 秒。它只应在已启动客户端、领取 AUTO 会话、建立参考并 ARM 后输入；`reference 0` 仅设置坐标，`move 0 ...` 才执行回零。
+
+完整的双终端硬件启动、仿真启动、停车退出、零点恢复、错误处理及局域网部署见[指令下发用户指南](docs/POSITION_USER_GUIDE.md)。重启后不自动恢复旧零点；测量轮脱离导丝或单独转动后，须重新确认物理参考。当前 8 mm/s 回零未通过稳定到位验证，不能将速度配置上限视为实机精度保证。
+
 ## 目录与阅读路径
 
 | 位置 | 作用 |
 |---|---|
 | `ros2_ws/src/gca_system_interfaces` | 编译生成的 msg／srv／action 定义 |
 | `ros2_ws/src/gca_core/gca` | 唯一控制核心、设备适配器、独立仿真与记录器 |
-| `ros2_ws/src/gca_ros` | Lifecycle、Action 桥接及 CLI |
+| `ros2_ws/src/gca_ros` | Lifecycle、Action 桥接及旧 CLI 兼容入口 |
+| `ros2_ws/src/gca_position` | 不依赖 ROS 的编码器采集、反馈估计、位移 PID 与仿真机构 |
+| `ros2_ws/src/gca_client` | 独立上位机客户端、持久 AUTO 会话与指令终端 |
+| `ros2_ws/src/gca_teleop` | 手柄采集、映射及 MANUAL 会话 |
 | `ros2_ws/src/system_coordinator` | 控制会话、许可与系统动作入口 |
 | `ros2_ws/src/system_bringup` | launch、仿真配置、禁止直接启用的硬件配置模板 |
 | `tests`、各包 `test` | 综合回归、ROS 进程集成、算法与设备测试 |
 | `tools` | 环境、构建、验证和报告入口 |
 | `config/servo_settings.py` | 不依赖 ROS 的舵机配置源，导出运行快照 |
+| `config/encoder_settings.py` | 不依赖 ROS 的编码器通信、测量轮比例与采集配置 |
 | `legacy` | 只读参考；不参与包发现、运行时导入或测试收集 |
 | `docs/prebuild_docs` | 实现前的设计与旧代码审查原文 |
 | `artifacts` | 本地运行、实测标定与验收记录，不进入 Git；原始实测证据应保留 |

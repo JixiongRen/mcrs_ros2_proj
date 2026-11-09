@@ -28,7 +28,7 @@ cd ..
 gca_source_install
 ```
 
-使用项目 Python 调用 colcon，确保 Python entry point 与 SDK 处在同一环境。`common.sh` 设置 `CMAKE_BUILD_PARALLEL_LEVEL=1`、`MAKEFLAGS=-j1`，并限制默认 ROS 发现到本机。Pi 内存有限，五包使用串行构建；不要让多个 agent 同时写同一个 build／install。
+使用项目 Python 调用 colcon，确保 Python entry point 与 SDK 处在同一环境。`common.sh` 设置 `CMAKE_BUILD_PARALLEL_LEVEL=1`、`MAKEFLAGS=-j1`，并限制默认 ROS 发现到本机。当前包含八个包，新增的 `gca_position` 和 `gca_client` 分别负责位置控制与上位机客户端。Pi 内存有限，各包使用串行构建；不要让多个 agent 同时写同一个 build／install。
 
 普通安装会复制 Python 文件。修改源码后须重新 build 才能验证新代码；不要用手工 PYTHONPATH 将源码插在 install 前面掩盖安装缺陷。开发中也可选 symlink-install，但最终验证始终使用独立普通安装。
 
@@ -38,7 +38,7 @@ gca_source_install
 bash tools/verify_software.sh
 ```
 
-依次执行 Ruff、五包 build、安装环境下的全部新测试、colcon test／test-result、独立目录普通安装、工作空间外资源检查，以及真实 ROS 进程仿真。每一步记录命令、工作目录、退出码、日志和用时，第一处失败使验证返回非零。JUnit 中必需软件测试的 skipped 不能当作通过。
+依次执行 Ruff、八包 build、安装环境下的全部新测试、colcon test／test-result、独立目录普通安装、工作空间外资源检查，以及真实 ROS 进程仿真。这是完整软件验收入口，局部改动不默认运行整套历史验证。每一步记录命令、工作目录、退出码、日志和用时，第一处失败使验证返回非零。JUnit 中必需软件测试的 skipped 不能当作通过。
 
 查看 `artifacts/verification/latest/report.json`；`pytest.xml` 是逐用例证据。干净安装保存在 `artifacts/clean-install/`，运行时只 source 官方 underlay 与本次 `local_setup.bash`，清除继承的 overlay 环境。CLI、launch 和 YAML 都从 install 查询。
 
@@ -52,7 +52,7 @@ gca_source_install
 "$GCA_PYTHON" -m ruff check ros2_ws/src tools tests
 ```
 
-只有综合验证通过后才更新完成状态。不要用 compileall 或 import 替代 ROS 服务与 Action 联调，也不要删除失败断言换取绿色结果。
+完成状态必须注明实际验证范围。位置闭环本轮采用定向测试与一次普通安装后的 ROS 联调，命令及范围见[位置用户指南](POSITION_USER_GUIDE.md#记录与软件复现)；通过后不追加同类测试。不要用 compileall 或 import 替代 ROS 服务与 Action 联调，也不要删除失败断言换取绿色结果。
 
 ## 扩展与注释规则
 

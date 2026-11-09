@@ -2,7 +2,7 @@
 
 本方案在现有舵机速度控制链上增加外部编码器位移闭环。上位机提交一个目标位置，树莓派根据编码器测得的实际位移修正舵机转速，直到到位并停车。手柄继续直接控制舵机 RPM，不采集外部编码器、不使用外部位置或速度修正杆量。
 
-本轮交付为设计和 [实施 goal prompt](POSITION_PID_ROS2_GOAL_PROMPT.md)，位置控制尚未实现。方案经过运行时、编码器与 PID、ROS 接口三个 agent 的代码审查和交叉讨论。实现以当前代码和[配置说明](CONFIGURATION_AND_CALIBRATION.md)为依据，不重新引入旧舵机 goal 中已被用户调整或延期的验收条件。
+本方案对应的位置软件、统一启动入口和持久客户端已实现；使用命令见[位置用户指南](POSITION_USER_GUIDE.md)，软件、ROS 仿真、实机与跨机验证结果分别见[实现状态](POSITION_PID_IMPLEMENTATION_STATUS.md)。方案及实现经过运行时、编码器与 PID、ROS 接口三个 agent 的交叉讨论；原始任务约束保留在 [实施 goal prompt](POSITION_PID_ROS2_GOAL_PROMPT.md)。后续实机中，紧固后 100 mm、2 mm/s 推进通过，8 mm/s 回零超调后由测试脚本停车。本阶段按用户要求先归档当前实现，未修正的超调和期限错误码问题保留在状态文档中。
 
 ## 1. 实现边界
 
@@ -21,18 +21,18 @@
 
 ### 1.1 模式控制开关
 
-统一入口拟命名为 `system_bringup/feed_axis.launch.py`，必须显式指定 `control_mode`；后端 `backend` 与控制模式分别选择。以下是待实现的入口约定，当前不能直接执行，路径占位符需替换为实际导出的快照：
+统一入口为 `system_bringup/feed_axis.launch.py`，必须显式指定 `control_mode` 和 `backend`。以下展示本机硬件入口的参数形式，路径占位符需替换为组合导出的匹配快照；手柄还需按[舵机指南](SERVO_USER_GUIDE.md)传入已标定 profile。完整可执行步骤见[位置用户指南](POSITION_USER_GUIDE.md)。
 
 ```bash
 # 手柄开环控制
 ros2 launch system_bringup feed_axis.launch.py \
   control_mode:=manual backend:=hardware \
-  servo_config_file:=/实际路径/manual.json
+  servo_config_file:=/实际路径/manual.json trusted_local_control:=true
 
 # 上位机位移闭环控制
 ros2 launch system_bringup feed_axis.launch.py \
   control_mode:=position backend:=hardware \
-  servo_config_file:=/实际路径/position.json
+  servo_config_file:=/实际路径/position.json trusted_local_control:=true
 ```
 
 | 控制开关 | 用户含义 | ControlSession.mode | 固定执行策略 |
@@ -86,7 +86,7 @@ ROS 回调只做请求校验、提交和结果通知。控制线程处理任务�
 | `gca_client` | 新增 | 上位机持久客户端、线性指令 CLI、会话续租、取消与状态查询；不依赖服务端实现或硬件驱动 |
 | `system_bringup` | 保留 | 统一模式开关、节点装配、配置路径、发现范围和退出管理；不承担控制算法或另一套权限逻辑 |
 
-新增模块建议如下，按实际需要实现，不建立空壳类：
+新增业务模块如下；位置组件在 `gca_position/assembly.py` 装配并由设备节点注入运行时：
 
 ```text
 gca_position/
@@ -108,7 +108,7 @@ gca_client/
 
 | 现有组件 | 用法及必要调整 |
 |---|---|
-| `gca/runtime/feed_axis.py` | 增加位置策略分支，实现现有位置任务与参考占位接口；保留舵机 I/O、授权、STOP 和有界队列 |
+| `gca/runtime/feed_axis.py` | 按固定策略处理位置任务、参考与手柄速度；保留舵机 I/O、授权、STOP 和有界队列 |
 | `gca/domain/position.py` | 保留共享契约、`MechanicalMapping`、`resolve_braking_parameters`；具体位置策略在 `gca_position` 实现并注入 |
 | `gca/devices/encoder.py` | 原驱动复用；位置专用采集所有者放在 `gca_position/acquisition.py` |
 | `gca/estimation/linear.py` | 原计数展开及参考复用；有限速度窗口放在 `gca_position/feedback.py`，旧双轴默认行为不变 |
@@ -120,7 +120,7 @@ gca_client/
 
 ## 3. 配置与参数
 
-人工配置仍只来自 `config/servo_settings.py` 和 `config/encoder_settings.py`。新增一个组合导出工具，调用现有配置函数，生成有 schema、修订号和摘要的位置运行快照；不增加第三份手工参数表。
+人工配置仍只来自 `config/servo_settings.py` 和 `config/encoder_settings.py`。`tools/export_feed_axis_config.py` 调用这两个脚本的配置函数，生成 schema 3、含修订号及摘要的位置运行快照；不增加第三份手工参数表。
 
 快照组合舵机运行参数、舵机位移参数、编码器参数，以及互相一致的 `control_mode` 和执行策略。模式由导出工具的显式选项传入，不另设容易漂移的 Python 模式常量。扩展现有 `gca/servo_config.py` 的严格类型和摘要校验，手柄旧快照继续按原语义读取；位置配置不能因缺字段而悄悄降级。仍通过 `servo_config_file` 交给设备节点和协调器，运行节点不执行配置脚本。改参数后重新导出并重启，不做在线修改。
 
@@ -136,7 +136,7 @@ gca_client/
 | 行程及余量 | 软件行程 −50～1000 mm；两端各保留 10 mm，首期允许目标为 −40～990 mm |
 | 到位条件 | 最终误差 ≤1 mm、外部测量速度绝对值 ≤0.1 mm/s，持续 0.3 s |
 | 制动计算 | 实测减速度和延迟仍为 `None`，使用已授权缺省值 5 mm/s²、0.5 s，并记录来源 |
-| 新增估计参数 | 在编码器脚本增加 `estimation.velocity_window_s=0.2`，仅位置策略使用 |
+| 估计参数 | 编码器脚本的 `estimation.velocity_window_s=0.2`，仅位置策略使用 |
 
 编码器已有一次约 2 秒、100 次成功查询的[耗时记录](../artifacts/encoder_readonly/timing-7x7x_4_p/report.json)：中位数 8.03 ms、最大 13.25 ms，20 ms 查询节拍无漏周期。此记录支持初始采集参数，不需要在实现前重新做串口压力测试。
 
@@ -144,7 +144,7 @@ gca_client/
 
 ## 4. 位置参考与上位机接口
 
-位置入口 configure 后保持 DISARMED，编码器已经采集。操作流程为：configure、activate → 领取 AUTO 会话并持续续租 → 显式设置线性参考 → ARM → 提交位移任务。
+位置入口 configure 后保持 DISARMED，编码器已经采集。操作流程为：configure、activate → 领取 AUTO 会话并持续续租 → 显式设置线性参考 → 等待约 0.2 秒速度窗口有效且静止 → ARM → 提交位移任务。`GcaClient.set_linear_reference()` 会等待新参考及有效速度窗口；未建立参考前不应等待 `linear_valid=true`。
 
 软件参考把当前编码器位置映射到指定坐标，例如 0 mm；不写编码器硬件置零寄存器。同一装配运行期间，多个目标共用这一固定坐标系。绝对 20 mm 表示固定零点前方 20 mm；相对 +5 mm 在正式接纳任务时，由新鲜实测位置解析为一次固定的绝对目标，执行中不反复累加。
 
@@ -158,11 +158,11 @@ gca_client/
 | 参考与使能 | `/system/set_reference`、`arm`、`disarm` |
 | 任务 | `/system/execute_motion`，使用现有 `ExecuteMotion` Action |
 | 停止与结果 | `/system/request_stop`、Action cancel、`get_command_status` |
-| 状态 | `/system/state`、已有能力查询服务 |
+| 状态及能力 | `/system/state`、`/gca/get_capabilities`；无 `/system/get_capabilities` |
 
 Action 限定 `axis_mask=LINEAR`、`mode=ABSOLUTE/RELATIVE`、`end_policy=STOP`，旋转目标为零。必须有有效 reference、命令身份、会话和有限的接纳/执行超时；任务忙时拒绝新任务。相对目标解析后的范围也必须校验。重复命令复用现有去重语义，不重复执行。
 
-ROS 边界使用 m、m/s、m/s²，核心使用 mm、mm/s、mm/s²；设备侧转换只在 `gca_ros/conversion.py` 完成。上位机客户端的用户单位在 `gca_client` 边界转换为 ROS 单位，不调用服务端转换模块。客户端应显式发送线性目标：例如 +5 mm 对应 `linear_m=0.005`，全局速度/加速度上限分别对应 `0.01 m/s`、`0.01 m/s²`。当前 `GcaClient.make_goal()` 的双轴、20°旋转及 50 mm/s²默认加速度不能用于此入口；迁移客户端时新增线性调用方式并保留已有调用兼容性。
+ROS 边界使用 m、m/s、m/s²，核心使用 mm、mm/s、mm/s²；设备侧转换只在 `gca_ros/conversion.py` 完成。上位机客户端的用户单位在 `gca_client` 边界转换为 ROS 单位，不调用服务端转换模块。`GcaClient.make_linear_goal()`／`move_linear()` 显式发送 LINEAR 和零旋转目标，并检查能力上限：例如 +5 mm 对应 `linear_m=0.005`，全局速度/加速度上限分别对应 `0.01 m/s`、`0.01 m/s²`。兼容保留的 `make_goal()` 双轴默认值不用于位置入口。
 
 首期上位机使用 ROS2 客户端；不另建 TCP 网关。位置 launch 显式提供本机与局域网发现配置，双方 ROS_DOMAIN_ID 一致；不继续无条件强制 LOCALHOST。授权与许可保留，远程客户端不发送被当作树莓派单调时钟的时间戳。树莓派本机联调通过只证明本机链路，跨机通信结果单列。
 
@@ -197,7 +197,7 @@ rpm = servo.direction_sign × 60 × v_limited / servo.mm_per_shaft_revolution
 
 ## 7. 授权与通信时序
 
-现有代码有多处手柄专用条件：`FeedAxisRuntime.arm()`、`_valid_output()`、`_enable_allowed()`、实际写入截止，以及 `ServoControlNode._arm_runtime()`。位置分支必须改为检查 AUTO 会话、位置任务、参考和编码器反馈，不能伪造手柄 quality，也不能把 `_input_deadline=0` 带入位置写入条件。
+`FeedAxisRuntime.arm()`、`_valid_output()`、`_enable_allowed()`、最终写入检查及 `ServoControlNode._arm_runtime()` 已按固定策略分支。位置分支检查 AUTO 会话、位置任务、参考和编码器反馈，不需要手柄 quality 或 LT；手柄分支保留既有输入期限。
 
 保留以下独立时间约束：
 
@@ -217,7 +217,7 @@ rpm = servo.direction_sign × 60 × v_limited / servo.mm_per_shaft_revolution
 
 ## 8. 状态与操作边界
 
-位置模式的 `GcaState.linear_*`、参考、通用位置反馈年龄和样本身份来自外部编码器；嵌套 `ServoState` 保留舵机轴数据和独立年龄。修改 `stop_from_core()` 中把所有 `FeedRuntimeState.linear_confirmed` 固定为 false 的逻辑，但不得将舵机停止证据冒充编码器停止证据。
+位置模式的 `GcaState.linear_*`、参考、通用位置反馈年龄和样本身份来自外部编码器；嵌套 `ServoState` 保留舵机轴数据和独立年龄。`StopStatus.servo_confirmed` 与 `linear_confirmed` 分别来自舵机和编码器，不相互替代。观测过期会撤销相应证据，协调器不保留已经过期的停止确认标志。
 
 手柄模式保持外部位移无效，不发布推算位置冒充测量。AUTO 模式下不要求手柄开机、LT 或 B。现有 B 停车依赖手柄的 MANUAL 会话，首期不增加跨所有者权限；AUTO 通过上位机 STOP 或 Action cancel 停止，不能在指南中宣称 B 已能停止 AUTO。
 
@@ -225,7 +225,7 @@ rpm = servo.direction_sign × 60 × v_limited / servo.mm_per_shaft_revolution
 
 ## 9. 实施顺序与有限验证
 
-先固定共享契约、包依赖与模式映射，完成配置装配和 `gca_position` 的纯 Python 位置策略，再以组件注入接入现有运行时、ROS Action 及 `gca_client`，最后增加模拟器中的推进机构及独立编码器反馈。模拟位移由实际接受的舵机输出经过机构模型产生，不能直接赋值为目标；加入一个固定滑移工况，证明 PID 能针对测量误差修正。
+实现已按共享契约、配置与位置组件、运行时、ROS 接口和持久客户端的顺序完成。模拟位移由实际接受的舵机输出经过机构模型产生，不直接赋值为目标；`tools/verify_position_simulation.py` 使用一次启动及固定滑移工况检查闭环行为。实际结果与证据以[实现状态](POSITION_PID_IMPLEMENTATION_STATUS.md)为准，不以本节列出的验证范围代替通过记录。
 
 只安排以下验证，不按函数数目堆叠测试：
 

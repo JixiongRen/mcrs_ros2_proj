@@ -1,17 +1,17 @@
 # ROS 2 接口与语义
 
-正式 IDL 位于 [`gca_system_interfaces`](../ros2_ws/src/gca_system_interfaces)。原双轴 GCA 的公共动作入口是 `/system/execute_motion`，协调器代理 `/gca/execute_motion`。仅舵机 profile 使用专用速度话题，当前拒绝位置 Action。原系统设计的磁驱动联合实验 `/system/execute` 未在本轮实现，不接受“假磁驱动成功”。
+正式 IDL 位于 [`gca_system_interfaces`](../ros2_ws/src/gca_system_interfaces)。公共动作入口是 `/system/execute_motion`，协调器代理 `/gca/execute_motion`。当前推进舵机 profile 由固定 `control_mode` 选择手柄原生 RPM 或外部编码器位移 PID；原双轴 GCA 接口继续兼容。磁驱动联合实验 `/system/execute` 尚未实现，不接受“假磁驱动成功”。位置功能使用说明及验证范围见[位置指南](POSITION_USER_GUIDE.md)和[实现状态](POSITION_PID_IMPLEMENTATION_STATUS.md)。
 
 ## 接口列表
 
 | 名称 | 类型 | 调用者与行为 |
 |---|---|---|
-| `/system/claim_control` | `ControlSession` service | 客户端领取唯一源会话，选择 AUTO／MANUAL／MAINTENANCE |
+| `/system/claim_control` | `ControlSession` service | 领取唯一源会话；舵机 manual 只接收 MANUAL，position 只接收 AUTO，原双轴保留已有模式 |
 | `/system/renew_control` | `ControlSession` service | 同会话、同代次、递增序号续租 |
 | `/system/acknowledge_generation` | `ControlSession` service | 当前owner确认ARM后的新代次，收回交接期受限STOP别名 |
 | `/system/release_control` | `ControlSession` service | 撤销源会话及设备许可，触发停止 |
 | `/system/get_motion_permit` | `ControlSession` service | 给一个命令上下文签发固定截止时间的一次性准入许可 |
-| `/system/execute_motion` | `ExecuteMotion` action | 单轴／双轴绝对或相对定位 |
+| `/system/execute_motion` | `ExecuteMotion` action | position 仅单轴线性绝对/相对定位；原双轴保留单轴/双轴行为 |
 | `/system/manual_target` | `JogCommand` topic | MANUAL 模式的新鲜 deadman 速度输入 |
 | `/system/servo_manual_target` | `ServoJogCommand` topic | 仅舵机 profile 的 MANUAL 轴转速输入 |
 | `/system/{arm,disarm,reset_fault,request_stop,set_reference}` | `ManageDevice` service | 经会话授权的管理请求 |
@@ -34,13 +34,13 @@
 
 接口类型可通过 `ros2 interface show gca_system_interfaces/action/ExecuteMotion` 查看。生命周期、设备管理与源会话是不同状态维度，不能只看 node active 就认为可以运动。
 
-## 仅舵机 profile
+## 舵机 profile：manual
 
-新 launch 使用 `servo_control_node` 可执行入口，ROS 节点仍命名为 `/gca_control_node`。与原双轴执行端互斥，不能同时创建相同 `/gca/*` 服务。`configure/activate/claim/arm/stop/disarm/release` 仍由同一个 teleop owner 管理；本模式不调用毫米或步进参考。
+统一 `feed_axis.launch.py` 和旧手柄 launch 使用 `servo_control_node`，ROS 节点仍命名为 `/gca_control_node`。它与原双轴执行端互斥，不能同时创建相同 `/gca/*` 服务。manual 下的 `configure/activate/claim/arm/stop/disarm/release` 由同一个 teleop owner 管理；不调用毫米或步进参考。
 
 `ServoJogCommand` 包含 `context`、`token`、`deadman`、`servo_angular_velocity_rad_s`、`ttl_s` 和 `quality`。角速度表示舵机轴原生正方向，不是导管旋转速度或推进线速度。核心使用 RPM，边界按 `rad/s = rpm × 2π/60` 转换；原 `JogCommand` 的单位与含义保持不变。
 
-`ExecutionLease.control_policy` 明确区分 `LEGACY_DUAL_AXIS` 与 `MANUAL_SERVO_VELOCITY`，由协调器依据已认证会话绑定；执行端再次验证，续期不能改变策略。新 profile 的 MANUAL 会话只允许舵机速度控制，未来 `POSITION_EXTERNAL_ENCODER` 尚未启用。`ManageDevice` 增加 `has_input_quality` 和 `input_quality`，用于真实舵机 ARM 的输入复核：默认 `qualified_state` 要求真实资格；显式 `joydev_hold` 使用 `JOYDEV_HELD_ARM` 中立观察，仅允许零目标使能。缺失或不匹配当前配置的输入证据不能以普通管理请求绕过。
+`ExecutionLease.control_policy` 区分 `LEGACY_DUAL_AXIS`、`MANUAL_SERVO_VELOCITY` 和 `POSITION_EXTERNAL_ENCODER`，由协调器依据固定配置与已认证会话绑定；执行端再次验证，续期不能改变策略。manual 的 MANUAL 会话只允许舵机速度控制。`ManageDevice.has_input_quality/input_quality` 用于真实手柄 ARM 的输入复核：默认 `qualified_state` 要求真实资格；显式 `joydev_hold` 使用 `JOYDEV_HELD_ARM` 中立观察，仅允许零目标使能。缺失或不匹配当前手柄配置的输入证据不能以普通管理请求绕过。
 
 `GcaState.servo` 是 `ServoState`：包含 `raw_position_count`、`shaft_angle_rad`、请求／接受／实测角速度、力矩、硬件错误、watchdog、配置状态、样本序号、设备代次、`sampled_ns`、年龄与有效性。`sampled_ns` 是本机读取完成的单调时刻，不是设备硬件采样时钟。`valid=false` 时数值不可当作测量。舵机轴角属于寄存器坐标，不证明真实推进距离；原外部位移和导管旋转有效标志保持 false。
 
@@ -48,7 +48,25 @@
 
 `GetCapabilities` 增加 `control_profile`、`servo_config_sha256`、`can_servo_velocity`、`can_measure_servo` 和 `max_servo_velocity_rad_s`；手柄与设备核对同一配置快照。`can_linear_motion`、`can_rotation_motion` 和外部测量能力在纯舵机模式为 false。可用软件能力不代表硬件验收通过，`unverified_capabilities` 继续报告无线资格与舵机停止 HIL 等未验证项。
 
-本模式的 `/system/execute_motion`、`/gca/execute_motion` 明确拒绝尚未实现的外部编码器位置控制；不返回假成功。舵机快照不走原 YAML 在线更新，返回 `SERVO_SNAPSHOT_RECONFIGURE_REQUIRED`，需停止、DISARM 并 cleanup 后重新 configure；两端日常调参采用整组重启。具体步骤见[舵机指南](SERVO_USER_GUIDE.md)。后续章节的 mm/deg、位置 Action 与双轴参考说明针对原双轴 profile。
+manual 模式的 `/system/execute_motion`、`/gca/execute_motion` 拒绝位移任务；使用位置功能必须按停机流程切换装配。舵机快照不走原 YAML 在线更新，返回 `SERVO_SNAPSHOT_RECONFIGURE_REQUIRED`；日常调参先 STOP 确认、DISARM、release，再退出并重启整组节点。具体步骤见[舵机指南](SERVO_USER_GUIDE.md)。
+
+## 舵机 profile：position
+
+交互使用 `ros2 run gca_client gca_client position-shell`；完整启动和指令格式见[指令下发用户指南](POSITION_USER_GUIDE.md)。客户端以 mm、mm/s、mm/s² 接受输入，ROS 消息边界使用 m、m/s、m/s²，核心仅在边界转换一次。
+
+`feed_axis.launch.py control_mode:=position backend:=simulation|hardware` 必须使用匹配的 schema 3 组合快照。设备和协调器的模式参数只读；启动不自动 claim、reference 或 ARM。协调器只准入 AUTO 会话，设备只接收 `POSITION_EXTERNAL_ENCODER` 执行许可。position 拒绝所有手柄 Jog，包括 `deadman=false`；普通管理 STOP 和 Action cancel 继续可用。手柄 B 没有跨 AUTO 所有者的停止权限。
+
+configure 时启动独立编码器采集。领取 AUTO 会话后调用 `/system/set_reference`，只允许 `axis_mask=1`、`rotation_rad=0`；`linear_m` 是赋给当前位置的软件参考坐标。此操作不移动机构、不写硬件零点，并清空速度窗口；新窗口有效且机构静止后才能 ARM。位置 ARM 不要求 `has_input_quality` 或 LT。参考失效、反馈故障或重连后，旧任务不能续跑，需要恢复、显式重新 reference 和 ARM。
+
+`ExecuteMotion` 的 position 子集为 `target.axis_mask=1`、`target.mode=1|2`、`target.rotation_rad=0`、`end_policy=1`；拒绝 HOLD、双轴及运动中替换。一次只有一个活动任务，相对目标在接纳时由新鲜位置解析一次。所有数值仍需有限；旋转限制字段保留既有正数格式，但不产生旋转输出。
+
+`GcaState.control_policy` 是实际控制策略；`mode="SERVO_ONLY"` 是设备 profile，不表示 MANUAL/AUTO 会话。position 的 `linear_position_m`、`linear_velocity_m_s`、对应有效性、参考、`sample_seq`、`device_epoch` 及 `feedback_age_s` 来自外部编码器；嵌套 `servo` 保留独立舵机数据。未建立参考前，不能把 `linear_valid=false` 当作没有通信；可结合样本序号与反馈年龄判断是否已读到原始数据。
+
+`StopStatus.servo_confirmed` 表示新鲜舵机停止证据，`linear_confirmed` 表示独立编码器零速证据；过期观测会撤销相应标志。外部反馈失效时，即使舵机已停也不能报告位移到达。成功需要误差和外部速度同时满足容差及驻留要求，并在正式 STOP 后再次核对最终反馈；返回 `outputs_held=false`。取消或故障不等待到位驻留，仍需完成既有停止及唯一终态流程。
+
+配置完成并装配 position 后，`/gca/get_capabilities` 才声明 `can_linear_motion/can_measure_linear=true`，`can_servo_velocity=false`；线速度与加速度上限在 `limits.max_linear_m_s/max_linear_m_s2`，当前均为 0.01。未配置时运动能力为 false；能力声明不代替状态有效性或实机验收。没有新增 `/system/get_capabilities` 服务。
+
+上位机安装 `gca_client` 与接口包即可，不依赖设备实现。`GcaClient.set_linear_reference()` 等待新参考及有效速度窗口；`make_linear_goal()`、`move_linear()` 使用明确的线性目标和能力限制，持久客户端自动续租。旧 `gca_ros.cli` 仅兼容转发；操作入口为 `ros2 run gca_client gca_client position-shell`。
 
 ## 单位、身份与时效
 
@@ -62,7 +80,7 @@ ROS 字段全部使用 SI：位置 m、角度 rad、速度 m/s 或 rad/s、加�
 
 ## ExecuteMotion
 
-Goal 的 `target.axis_mask` 为 LINEAR=1、ROTATION=2、双轴=3；`target.mode` 为 ABSOLUTE=1、RELATIVE=2。`reference_id` 必须对应当前参考。所选轴的目标、速度及加速度必须有限并位于配置上限内；未选轴不继承旧 HOLD。双轴整体校验后才占用目标槽。
+IDL 的 `target.axis_mask` 为 LINEAR=1、ROTATION=2、双轴=3；`target.mode` 为 ABSOLUTE=1、RELATIVE=2。position 使用上节的受限子集，其余双轴/HOLD 行为仅适用于原双轴 profile。`reference_id` 必须对应当前参考。所选轴的目标、速度及加速度必须有限并位于配置上限内；未选轴不继承旧 HOLD。双轴整体校验后才占用目标槽。
 
 `end_policy`：UNSPECIFIED=0 被拒绝，STOP=1 到位后停止并核验，HOLD=2 到位后保留独立保持上下文。结果含：
 
@@ -104,7 +122,7 @@ ROS Action 状态和业务结果需要一起读。例如授权过期导致中止
 
 ## 常见错误码与权限边界
 
-NOT_ARMED、NOT_ACTIVE、CONTROL_BUSY 表示前置状态不满足；INVALID_TOKEN、SESSION_EXPIRED、STALE_GENERATION、STALE_SEQUENCE 表示授权或顺序失效；ID_CONFLICT 表示同 ID 载荷不同；LINEAR_LIMIT／ROTATION_LIMIT 表示目标越界；FEEDBACK_STALE、OUTPUT_EXPIRED、DEVICE_TIMEOUT 表示监督触发；STOP_TIMEOUT／OUTPUT_STATE_UNKNOWN 表示停止证据不足。所有错误都要结合 state、有效性和 stop 字段处理，不能把错误替换成数值零。
+NOT_ARMED、NOT_ACTIVE、CONTROL_BUSY 表示前置状态不满足；CONTROL_MODE_MISMATCH 表示会话或执行策略与固定模式不符；POSITION_LINEAR_STOP_REQUIRED 表示位置请求超出 LINEAR/STOP 子集；INVALID_TOKEN、SESSION_EXPIRED、STALE_GENERATION、STALE_SEQUENCE 表示授权或顺序失效；ID_CONFLICT 表示同 ID 载荷不同；LINEAR_LIMIT／ROTATION_LIMIT 表示目标越界；FEEDBACK_STALE、ENCODER_FEEDBACK_STALE、OUTPUT_EXPIRED、DEVICE_TIMEOUT 表示监督触发；STOP_TIMEOUT／OUTPUT_STATE_UNKNOWN 表示停止证据不足。所有错误都要结合 state、有效性和 stop 字段处理，不能把错误替换成数值零。
 
 业务会话不是 DDS 身份认证。默认只发现本机节点，ROS_DOMAIN_ID 也不是安全机制。原生 CancelGoal 没有自定义 token 字段，同一可信 ROS 图中的客户端可能调用它；硬件部署必须使用受控主机账户并显式声明可信本机，或配置并强制 DDS Security。跨机权限策略不属于已经验收的本轮功能。故障注入只在模拟后端开启。
 
@@ -123,7 +141,7 @@ NOT_ARMED、NOT_ACTIVE、CONTROL_BUSY 表示前置状态不满足；INVALID_TOKE
 | SCRIPT_SAMPLE | 明确合成样本，仅simulation |
 | PROGRAMMED_JOG | 旧CLI jog(duration)的一次固定episode，后续帧不延长终点 |
 
-active Jog缺质量返回 `MANUAL_QUALITY_REQUIRED`；错误boot/未来或过期时间、回退序号、旧epoch重放及越过history容量均失败关闭。相同真实观察可携带递增命令seq，但固定截止不得改变。权限退休清理对应质量历史；普通STOP不清历史，避免旧epoch绕过。deadman=false保留受限停车路径。
+active Jog缺质量返回 `MANUAL_QUALITY_REQUIRED`；错误boot/未来或过期时间、回退序号、旧epoch重放及越过history容量均失败关闭。相同真实观察可携带递增命令seq，但固定截止不得改变。权限退休清理对应质量历史；普通STOP不清历史，避免旧epoch绕过。manual 的 deadman=false 保留受限停车路径；position 不接收手柄话题，使用其管理 STOP 或 Action cancel。
 
 每层取输入原截止、一次性nonce、租约和本地输出TTL的最小值；有限波形须整段落入该窗口，pigpio准备完成后发送前再次核验。控制线程冻结不让I/O获得now+TTL的新期限。`GcaState`新增 `stop_serial/input_valid_until_ns`、Jog受限速度、速度误差/积分和旋转相位/计划率；其中角速度仍是软件估计，不是机械角测量。
 

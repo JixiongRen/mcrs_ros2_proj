@@ -2,6 +2,8 @@
 
 以下步骤使用安装后的入口和模拟设备。普通 launch 不会 ARM、设参考或开始运动；演示命令和交互 shell 会按操作者明确输入的命令执行模拟动作。
 
+本页说明原双轴模拟入口。当前真实舵机与外部编码器的指令下发模式使用 `gca_client position-shell`，启动、绝对/相对移动、回零和停车步骤见[指令下发用户指南](POSITION_USER_GUIDE.md)，不要混用本页双轴 `shell` 的命令参数。
+
 手柄输入请使用 [手柄与模拟操作指南](TELEOP_USER_GUIDE.md)：先在工程根运行 `python3 tools/joystick_monitor.py`，即可独立查看原始输入日志，无需启动ROS；加已标定的 `--profile` 可查看操作判定。接入模拟执行器时，`gca_teleop_cli`复用持续运行的owner，不与下述交互shell同时claim。实体映射/无线资格和执行器HIL分开验收；默认实体profile保持锁定。
 
 ## 从新终端开始

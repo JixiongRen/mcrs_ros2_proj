@@ -22,9 +22,9 @@ flowchart TB
 
 ## 包与依赖方向
 
-`gca_system_interfaces` 是独立 IDL 包。`gca_core` 安装唯一 Python 包 `gca`，领域、算法与 runtime 不导入 rclpy。真实硬件库只在 `devices` 内延迟导入。`gca_ros` 做 ROS 与领域对象转换，`system_coordinator` 管理上游会话并代理 GCA-only 动作，`system_bringup` 安装启动和配置资源。
+`gca_system_interfaces` 是独立 IDL 包。`gca_core` 安装 Python 包 `gca`，领域、算法与 runtime 不导入 rclpy。真实硬件库只在 `devices` 内延迟导入。`gca_position` 依赖核心协议，提供无 ROS 的位置业务组件；`gca_client` 依赖 ROS 客户端库和接口消息，不导入设备实现。`gca_ros` 做 ROS 与领域对象转换，`system_coordinator` 管理上游会话并代理 GCA-only 动作，`gca_teleop` 负责手柄输入，`system_bringup` 安装启动和配置资源，共八个功能包。
 
-`legacy/` 只提供缺陷证据，不作为任何正式模块的导入来源。没有第二套 TCP 控制核心，也没有逐函数拆出的 PID／采样 ROS 节点。原双轴入口的 `/system/execute_motion` 表示 GCA 单轴／双轴动作；仅舵机入口明确拒绝位置任务。原系统设计中的 `/system/execute` 联合磁驱动实验仍属未来接口。
+`legacy/` 只提供缺陷证据，不作为任何正式模块的导入来源。没有第二套 TCP 控制核心，也没有逐函数拆出的 PID／采样 ROS 节点。原双轴入口的 `/system/execute_motion` 表示 GCA 单轴／双轴动作；舵机 manual 模式拒绝位置任务，position 模式只接收单轴位移任务。原系统设计中的 `/system/execute` 联合磁驱动实验仍属未来接口。
 
 ## 仅舵机路径
 
@@ -34,13 +34,23 @@ flowchart TB
 
 `config/servo_settings.py` 是独立配置来源，导出严格 JSON 快照；设备与手柄读取同一快照并核对摘要。运行时只有一个舵机串口所有者，独立检查原命令截止时间。持续读状态不能延长输出期限，Bus Watchdog 也不能替代这一检查。STOP 撤销输出后，零速写入失败仍独立尝试关闭力矩；没有新鲜停止证据时报告 UNKNOWN。
 
-`MANUAL_SERVO_VELOCITY` 绑定已认证 MANUAL 会话。运行时复用 `runtime/authority.py` 的公共租约及上下文校验、质量追踪和 STOP 屏障；不会因收到位置消息或编码器上线切换策略。外部位移和导管旋转有效标志为 false；轴角度和速度只写入 `GcaState.servo`。`POSITION_EXTERNAL_ENCODER`、反馈端口、机械换算和位置控制接口已经预留，位置能力仍关闭。
+`MANUAL_SERVO_VELOCITY` 绑定已认证 MANUAL 会话。运行时复用 `runtime/authority.py` 的公共租约及上下文校验、质量追踪和 STOP 屏障；不会因收到位置消息或编码器上线切换策略。该模式外部位移和导管旋转有效标志为 false；轴角度和速度只写入 `GcaState.servo`。位移能力通过独立 position 装配启用，见下节。
 
 真实手柄输入策略由同一舵机快照选择：默认 `qualified_state` 要求有效无线资格；本轮按用户修订显式使用 `joydev_hold`，以持续有效的本地输入观察支持 LT 持续控制，不限制单次操作时长。后者保持无线证据 `UNKNOWN`，不冒充已取得资格。当前 BFM 模式的空载手柄正反转联调已完成；停止后重新释放与回中、新一次 LT、真实停车确认等条件仍保留。操作与证据见[舵机指南](SERVO_USER_GUIDE.md)。以下双轴手柄、轨迹、外部编码器 PID 和脉冲段说明仍针对原双轴入口。
 
 `gca_teleop` 已实现独立输入采集、映射/门控、单一 MANUAL 会话 owner、容量1异步派发和同用户本机管理代理。正式路径为 `joydev/ScriptedInput → TeleopPipeline → ManualSession/LatestDispatcher → /system/manual_target → coordinator → /gca/jog → ControlRuntime`；采集、状态和代理均不直接操作执行器。左杆 LY 推进、LX 旋转，LT 为双轴 deadman，B 软件 STOP；右侧磁场输入预留。实际操作见 [手柄指南](TELEOP_USER_GUIDE.md)，实现与测试定位见 [追踪表](TELEOP_TRACEABILITY.md)。
 
 实体入口使用只读 Linux joydev：身份多候选、错误/积压、INIT/重同步和重连都失败关闭并刷新输入 epoch。默认 event_age 不把静态缓存、右侧变化或 reader 心跳当新运动事件；qualified_state 只有匹配真实资格记录时才允许持续观察旧状态。SCRIPT_SAMPLE 仅用于 simulation，PROGRAMMED_JOG 给旧 CLI 一次固定 episode；没有来源的 active Jog 拒绝。实体15步只读映射已复核通过；实体输入→simulation的第五轮仅观察到短暂推进，旋转确认脉冲为0，整体未通过，详见[实际记录](IMPLEMENTATION_STATUS.md)。无线资格仍NOT_RUN，不能声称实体手柄持续双轴控制已经验收。
+
+## 指令下发与位移闭环
+
+统一入口 `feed_axis.launch.py` 必须显式选择 `control_mode` 和 `backend`。position 装配只启动舵机设备节点及协调器，不启动手柄 owner；核心仍是同一个 `FeedAxisRuntime`，经 `gca.domain.position` 中的协议注入位置组件。`gca_core` 不反向导入 `gca_position`，`gca_client` 不依赖 `gca_ros` 或硬件库。
+
+命令链为 `gca_client → /system/execute_motion → system_coordinator → ServoControlNode → FeedAxisRuntime`。AUTO 会话绑定 `POSITION_EXTERNAL_ENCODER`；绝对目标使用固定参考，相对目标在接纳时解析一次，任务以 STOP 结束。位置策略由 `gca_position.strategy` 组合轨迹、PID、限幅与机械换算；`feedback` 展开计数、维护软件参考与实际时间速度窗口；`acquisition` 独立持有编码器串口；`assembly` 选择硬件或仿真组件。
+
+编码器反馈决定线性位置和速度，舵机自身轴状态独立保留。停车须分别取得外部线运动与舵机零速证据。任务执行期限、反馈有效期、控制输出有效期和会话租约分别判定；延长任务期限不会让旧反馈继续有效。
+
+manual 与 position 只允许停机后切换，不能运行中热改模式，也不因另一种输入到达而自动切换。用户操作见[指令下发指南](POSITION_USER_GUIDE.md)，有限实机结果和当前错误码、超调限制见[阶段状态](POSITION_PID_IMPLEMENTATION_STATUS.md)。
 
 ## 线程与资源
 

@@ -2,6 +2,8 @@
 
 本指南对应仅舵机入口 `servo_simulation.launch.py` 和 `servo_hardware.launch.py`。左杆上推使推进舵机反转，下推使其正转；杆量控制舵机轴转速。外部位移编码器与步进旋转轴不参与这一模式，因此不要求毫米参考，也不提供真实推进距离或导管旋转角度。
 
+这两个入口固定为 `manual`，也可通过统一 `feed_axis.launch.py control_mode:=manual` 启动。上位机位移闭环使用独立的 `position` 装配，操作见[位置用户指南](POSITION_USER_GUIDE.md)，验证范围见[位移闭环实现状态](POSITION_PID_IMPLEMENTATION_STATUS.md)。新增位置功能不会使本指南的手柄调速依赖编码器。
+
 当前使用 `manual_input_mode="joydev_hold"`：持续按住 LT 即可操作，不设单次时长上限；松开 LT 或按 B 请求 STOP。指令上限为 **80 rpm**（寄存器量化后为 79.921 rpm），软件加速度为 **40 rpm/s**。最近空载实测约为 ±45.8 rpm，指令上限不等于电机实际能够达到的转速。
 
 日常使用直接按下面的[真实舵机快速操作](#真实舵机快速操作)执行。需要查看输入而不驱动真实舵机时，使用[模拟舵机流程](#实体手柄控制模拟舵机)；调参见[配置入口](#配置入口与环境)。
@@ -118,13 +120,13 @@ python3 config/servo_settings.py export artifacts/servo_config/hardware.json \
 
 以上命令使用默认 `--section runtime`，JSON 是带版本与 SHA-256 摘要的运行快照，不另行手改。硬件和模拟快照的 `backend` 不同，不能互换。舵机节点、协调器和手柄节点必须加载**同一路径、同一内容**；标准launch将 `servo_config_file` 同时传给这三个节点。能力响应的配置摘要、后端或速度上限不匹配时，手柄拒绝 ARM。
 
-后续上位机位移闭环所需的驱动轮半径、传动比、PID 及运动限制，在同一脚本的 `position_settings_payload()` 中集中定义，可用 `python3 config/servo_settings.py show --section position` 查看。外部编码器参数另由 `python3 config/encoder_settings.py show` 查看。未知值保留 `None` 和 TODO；完整字段、单位、导出命令与标定关系见[上位机位移闭环参数草稿](CONFIGURATION_AND_CALIBRATION.md#上位机位移闭环参数草稿)。这两份草稿不能作为当前 `servo_config_file`，填写或导出不会启用 PID，也不会改变手柄控制。
+上位机位移闭环所需的驱动轮半径、传动比、PID 及运动限制，在同一脚本的 `position_settings_payload()` 中集中定义，可用 `python3 config/servo_settings.py show --section position` 查看。外部编码器参数另由 `python3 config/encoder_settings.py show` 查看。两项未知制动实测值仍保留 `None` 和 TODO；完整字段、单位及标定关系见[配置说明](CONFIGURATION_AND_CALIBRATION.md#上位机位移闭环参数草稿)。这两份单独的草稿不能直接作为 `servo_config_file`；位置模式使用 `tools/export_feed_axis_config.py` 生成 schema 3 组合运行快照。手柄模式不会读取外部编码器或执行位置 PID。
 
 刹车减速度与延迟为 `None` 时，参数解析分别采用 `braking_defaults` 中的 `5 mm/s²`、`0.5 s`；显示和导出的 `effective_braking` 会标明使用值及来源。填写实测值后自动优先使用该项实测值，原始 TODO 不会被缺省值覆盖。具体规则见[刹车实测值未知时的缺省策略](CONFIGURATION_AND_CALIBRATION.md#刹车实测值未知时的缺省策略)，当前手柄运行不受这两项 TODO 影响。
 
 `joydev_hold`的reader观察期限由舵机快照中的`manual_input_max_age_s`决定，当前为0.30秒；原profile中的`event_age`期限仍用于原事件模式，不用于连续观察。`qualified_state`仍服从profile与舵机配置中更短的期限。每条观察保留原始截止时间，不在转发时续期，也不限制持续按住LT的总时间。`joydev_hold`调度按`control_period_s`运行，并服从profile更低的发送频率上限；默认40毫秒一次。
 
-当前脚本中的指令上限raw349对应79.921 rpm，不超过用户规定的80 rpm；变化率40 rpm/s、固件加速度raw12、事务期限 0.08 s、反馈年龄 0.25 s、输出期限 0.30 s、停止确认期限 2 s、watchdog raw 25 等是当前空载联调参数，不代表所有失效场景的安全边界已经测定。`manual_axis_to_servo_sign=-1` 表示映射后 LY 上正下负到舵机方向的唯一转换；当前配置校验不接受改为正号。位移草稿已按用户确认填写 6 mm 半径、直驱、上推为推进正方向及 PID 初值，每转推进量按无滑动几何模型计算约为 37.6991 mm；这不是实测标定，也尚未接入闭环。当前运行快照中的 `mechanical_mapping`、`position_pid` 必须保持 `null`。
+当前脚本中的指令上限raw349对应79.921 rpm，不超过用户规定的80 rpm；变化率40 rpm/s、固件加速度raw12、事务期限 0.08 s、反馈年龄 0.25 s、输出期限 0.30 s、停止确认期限 2 s、watchdog raw 25 等是当前空载联调参数，不代表所有失效场景的安全边界已经测定。`manual_axis_to_servo_sign=-1` 表示映射后 LY 上正下负到舵机方向的唯一转换；当前配置校验不接受改为正号。位置配置已按用户确认填写 6 mm 半径、直驱、上推为推进正方向及 PID 初值，每转推进量按无滑动几何模型计算约为 37.6991 mm；这不是实测标定。新位置功能使用 schema 3 的 `position` 字段，旧兼容字段 `mechanical_mapping`、`position_pid` 仍保持 `null`。
 
 加速度raw12约为42.92 rpm/s，依据[ROBOTIS Profile Acceleration定义](https://emanual.robotis.com/docs/en/dxl/x/xm430-w350/#profile-acceleration108)。软件目标从零达到79.921 rpm约需2秒；这是限速器计算值，不是实测响应时间。厂家标称XM430-W350的空载转速为12 V时46 rpm、14.8 V时57 rpm；指令上限80 rpm不能提高电机本身的速度能力。一次速度写入与反馈读取分别使用80毫秒事务预算，I/O周期20毫秒按整轮计算，事务已超过周期时不追加等待。配置校验要求完整读写周期与控制周期能容纳于输出及输入期限。
 
@@ -299,12 +301,15 @@ MODE_OUTPUT="$(mktemp -d "$PWD/artifacts/servo_ros2/mode-binding.XXXXXX")"
 
 设备层也要求 cleanup 后重新 configure；若只对设备做 lifecycle cleanup，手柄节点仍可能持有旧快照，所以日常操作采用整组重启，保证三个节点摘要一致。`servo_config_file` 参数不能在线更换，`/system/apply_config` 不接收舵机 JSON 热更新。
 
+切换为上位机位移模式也必须先 STOP 确认、DISARM、release，再退出旧 launch；然后导出 position 快照并启动新装配。新装配保持未使能，需要 AUTO 会话、重新设置线性参考及 ARM；切回手柄需要松开 LT、摇杆回中，再走本指南的使能流程。模式与会话互斥，不能在线改 `control_mode`，也不因收到另一种指令而自动切换。位置模式使用上位机 STOP 或 Action cancel；B 只停止手柄当前持有的 MANUAL 会话，不能跨所有者停止 AUTO。
+
 | 拒绝或状态 | 处理依据 |
 |---|---|
 | `SERVO_CAPABILITY_CONFIG_MISMATCH` | 核对三个节点的实际快照、摘要、后端和速度上限；重导出并整组重启 |
 | `HARDWARE_INPUT_NOT_QUALIFIED`／硬件输入质量拒绝 | 默认 `qualified_state` 路径要求真实资格；本轮 `joydev_hold` 应核对三个节点是否加载同一显式快照 |
 | `EXTERNAL_POSITION_CONTROL_UNAVAILABLE`／`EXTERNAL_ENCODER_REQUIRED` | 纯舵机模式不设置毫米／步进参考 |
-| `EXTERNAL_ENCODER_POSITION_UNSUPPORTED`／`POSITION_CONTROL_UNAVAILABLE` | 本轮未实现上位机位移闭环，不能改发伪毫米速度规避 |
+| `CONTROL_MODE_MISMATCH`／`POSITION_CONTROL_UNAVAILABLE` | 当前是手柄装配或会话模式不匹配；按停机切换流程进入 position，再提交位移任务 |
+| `POSITION_LINEAR_STOP_REQUIRED` | position 首期只接收 LINEAR、零旋转目标、ABSOLUTE/RELATIVE 和 STOP 结尾；不接收 HOLD 或双轴目标 |
 | `WATCHDOG_LATCHED` | 保存锁存与停止证据，按明确恢复流程处理；不通过重新 configure 隐式清除 |
 | `DEVICE_BUSY`、串口独占失败 | 结束已有合法设备使用者，不并发试转或删除锁 |
 | `WAIT_NEUTRAL` | 松开 B 和 LT，让左杆回中；收到有效中立输入后，再新按 LT |
@@ -313,4 +318,4 @@ MODE_OUTPUT="$(mktemp -d "$PWD/artifacts/servo_ros2/mode-binding.XXXXXX")"
 | `GCA_INPUT_EXPIRED` | 释放LT、LY回中并检查输入模式：`joydev_hold` 核对reader观察是否推进，原 `event_age` 核对有效变化事件年龄 |
 | `SESSION_ALREADY_OWNED` | 查询现有 owner 状态，继续当前会话，不重复 claim |
 
-上位机位置策略的反馈类型、机械换算与 PID 接口已预留；真实外部编码器、标定、位置任务和 PID 硬件整定仍未实施，参见[接入方案](SERVO_ROS2_INTEGRATION_PLAN.md)。
+上位机位置策略、外部编码器采集、位置任务及 PID 软件已实现，真实机构已有有限联调记录：100 mm、2 mm/s 推进完成，8 mm/s 回零存在超调。本阶段保留当前参数，不继续实机整定。使用方法、零点恢复和验证结果分别见[指令下发用户指南](POSITION_USER_GUIDE.md)和[实现状态](POSITION_PID_IMPLEMENTATION_STATUS.md)。
