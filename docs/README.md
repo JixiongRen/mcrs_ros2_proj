@@ -14,6 +14,8 @@
 | 舵机使用者 | [真实舵机快速操作](SERVO_USER_GUIDE.md#真实舵机快速操作) | 两个终端启动、LT＋左杆正反转与调速、B 后恢复、快速重复操作、停止退出和文本记录 |
 | 舵机接入设计 | [舵机 ROS 2 与位移闭环方案](SERVO_ROS2_INTEGRATION_PLAN.md) | 手柄独立调速、纯 Python 配置、仅舵机接入及后续位移 PID 的设计依据；实际结果见状态文档 |
 | 舵机开发任务 | [真实舵机接入 goal prompt](SERVO_ROS2_IMPLEMENTATION_GOAL_PROMPT.md) | 实现范围、配置与接口、有限验证及软件／实机完成标准；保存 prompt 不代表开始执行 |
+| 位移闭环设计 | [上位机位移 PID 闭环方案](POSITION_PID_ROS2_PLAN.md) | 显式模式开关、功能包划分、手柄开环与上位机闭环隔离、到位和通信预算；当前为待实施方案 |
+| 位移闭环开发任务 | [位移 PID 实施 goal prompt](POSITION_PID_ROS2_GOAL_PROMPT.md) | 可用于后续实施的任务范围、最小改动和有限验证要求 |
 | 手柄实施准备 | [实现与可控性验证方案](TELEOP_IMPLEMENTATION_PLAN.md) | 实现依据、原始JF缺陷与JT01–JT20预声明判据；执行状态见状态文档 |
 | 手柄开发任务 | [实现goal prompt](TELEOP_IMPLEMENTATION_GOAL_PROMPT.md) | 本轮多agent实施的任务、约束和完成标准；实际结果另由报告确认 |
 | 维护者 1 | [架构](ARCHITECTURE.md) | 模块、状态写入、I/O 所有权和停止路径 |
